@@ -12,16 +12,19 @@ import { parseUplink, FrameError } from './lib/cjt188.js';
 import {
   decodeCat1Frame,
   decodePayload,
+  decodeReadResponse,
   decodeWriteResponse,
   encodeReportAck,
   isCat1Frame,
   CAT1_REPORT_CONTROL,
+  READ_RESPONSE_CONTROL,
   WRITE_RESPONSE_CONTROL,
 } from './lib/cat1.js';
 import { FrameSplitter, peekEnvelope } from './lib/framing.js';
 import {
   formatMeterReading,
   formatCat1Reading,
+  formatReadResponse,
   formatTcpEvent,
   formatUnrecognisedFrame,
   formatUnframedBytes,
@@ -68,6 +71,7 @@ export function createMeterConnectionHandler(store, log = console, { commands = 
       const envelope = decodeCat1Frame(frame);
 
       if (envelope.control === WRITE_RESPONSE_CONTROL) return handleWriteResponse(frame, hex);
+      if (envelope.control === READ_RESPONSE_CONTROL) return handleReadResponse(frame, hex);
       if (envelope.control !== CAT1_REPORT_CONTROL) {
         throw new FrameError('unexpected_control', `control ${envelope.controlName} is not handled here`);
       }
@@ -148,6 +152,17 @@ export function createMeterConnectionHandler(store, log = console, { commands = 
         }),
       );
       log.info?.(formatTcpEvent('command reply raw', { peer, detail: hex }));
+    };
+
+    /**
+     * A read response carries no success byte -- the data field *is* the answer,
+     * so a well-formed 81H frame means the read succeeded.
+     */
+    const handleReadResponse = (frame, hex) => {
+      const response = decodeReadResponse(frame);
+      const cmd = commands?.findSentByInstruction(response.address, response.instructionNumber);
+      if (cmd) commands.complete(cmd, { success: true, detail: 'parameters returned' });
+      log.info?.(formatReadResponse(response, hex, { peer }));
     };
 
     const decodeCjt188 = (frame, hex) => {

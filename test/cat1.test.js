@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { parseCat1, decodeCat1Frame, isCat1Frame } from '../src/lib/cat1.js';
+import { parseCat1, decodeCat1Frame, isCat1Frame, decodeTableTypeCode } from '../src/lib/cat1.js';
 import { FrameError } from '../src/lib/cjt188.js';
 import { CAT1_FRAME, CAT1_FRAMES, DEVICE_METER_ADDRESS, REFERENCE_FRAME } from './fixtures.js';
 
@@ -126,4 +126,27 @@ test('an undecoded packet type reports which type it was', () => {
     () => parseCat1(other),
     (err) => err instanceof FrameError && err.code === 'unsupported_packet_type',
   );
+});
+
+test('table type code decodes the meter configuration', () => {
+  const { payload: p } = parseCat1(CAT1_FRAME);
+  assert.equal(p.tableTypeCode, '0027');
+  assert.equal(p.meterConfig.paymentType, 'postpaid'); // agrees with packet type 03
+  assert.equal(p.meterConfig.valveType, 'switch');
+  // The reason a short run of water never moves the counters.
+  assert.equal(p.meterConfig.resolutionLitres, 1000);
+});
+
+test('metering resolution decodes across all four scopes', () => {
+  const scopes = { 0b00: 1, 0b01: 10, 0b10: 100, 0b11: 1000 };
+  for (const [bits, litres] of Object.entries(scopes)) {
+    assert.equal(decodeTableTypeCode(0x0024 | Number(bits)).resolutionLitres, litres);
+  }
+});
+
+test('payment type decodes across all four modes', () => {
+  const modes = { 0b00: 'prepaid', 0b01: 'pre-ladder', 0b10: 'postpaid', 0b11: 'hvac_valve' };
+  for (const [bits, name] of Object.entries(modes)) {
+    assert.equal(decodeTableTypeCode((Number(bits) << 4) | 0b0111).paymentType, name);
+  }
 });

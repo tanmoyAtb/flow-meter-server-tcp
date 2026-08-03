@@ -69,6 +69,26 @@ const REPORT_TRIGGERS = [
 
 const VALVE_STATES = { 0: 'open', 1: 'closed', 3: 'abnormal' };
 
+// Section 23.3, 0xAB06 table type code.
+const PAYMENT_TYPES = { 0: 'prepaid', 1: 'pre-ladder', 2: 'postpaid', 3: 'hvac_valve' };
+const METERING_SCOPE_LITRES = { 0: 1, 1: 10, 2: 100, 3: 1000 };
+
+/**
+ * Table type code bit fields (section 23.3).
+ *
+ * `resolutionLitres` is the one that catches people out: a meter with a 1000 L
+ * scope only increments its counters once a full cubic metre has passed, so a
+ * short run of water leaves every usage field looking frozen.
+ */
+export function decodeTableTypeCode(code) {
+  return {
+    raw: code.toString(16).toUpperCase().padStart(4, '0'),
+    paymentType: PAYMENT_TYPES[(code >> 4) & 0b11],
+    valveType: (code >> 2) & 0b1 ? 'switch' : 'blocked_turn',
+    resolutionLitres: METERING_SCOPE_LITRES[code & 0b11],
+  };
+}
+
 // Control codes a meter can send us: its periodic report, and its replies to
 // commands we issued. Kept narrow on purpose -- widening this to every control
 // code would start pulling CJ/T 188 frames into the wrong decoder.
@@ -212,6 +232,7 @@ export function decodePostpaid03(buf) {
   return {
     manufacturerCode: buf.subarray(17, 19).toString('hex').toUpperCase(),
     tableTypeCode: buf.subarray(19, 21).toString('hex').toUpperCase(),
+    meterConfig: decodeTableTypeCode(u16(buf, 19)),
     hardwareVersion: buf.subarray(21, 23).toString('hex').toUpperCase(),
     softwareVersion: buf.subarray(23, 25).toString('hex').toUpperCase(),
     // 15 digits plus one pad nibble, per the parameter table for 0xAB01.
@@ -388,6 +409,119 @@ export function encodeValveOperation({ meterTypeCode = 0x10, address }, { open, 
   cmd[28] = checksum(cmd);
   cmd[29] = FRAME_END;
   return cmd;
+}
+
+// --- reading the meter's configuration (protocol section 1.1) -------------
+
+export const READ_CONTROL = 0x01; // server issues a read command
+export const READ_RESPONSE_CONTROL = 0x81; // meter's reply to that read
+export const READ_ALL_IDENTIFIER = 0xa901; // the one documented read: dump parameters
+
+/**
+ * Read the meter's stored parameters (protocol section 1.1, identifier A901H).
+ *
+ *   68 | T | A6-A0 | 03 | 01 | instruction no. | 0000 | 0AH | A901 |
+ *   spare(8) | CS | 16                                  -- 28 bytes, m = 0AH
+ *
+ * The only read the protocol defines, and it returns the whole configuration
+ * block in one response. Worth having for its own sake, but its real value is
+ * diagnostic: a write that comes back refused says nothing about *why*, whereas
+ * this reports the payment mode, metering mode and valve-control shielding that
+ * decide whether a valve command is allowed to act at all.
+ */
+export function encodeReadParameters({ meterTypeCode = 0x10, address }, instructionNumber) {
+  const cmd = Buffer.alloc(28);
+  cmd[0] = FRAME_START;
+  cmd[1] = meterTypeCode;
+  addressBytes(address).copy(cmd, 2);
+  cmd[9] = CAT1_DEVICE_TYPE;
+  cmd[10] = READ_CONTROL;
+  cmd.writeUInt16BE(instructionNumber & 0xffff, 11);
+  cmd.writeUInt16BE(0x0000, 13); // spare
+  cmd[15] = 0x0a; // data length: identifier(2) + spare(8)
+  cmd.writeUInt16BE(READ_ALL_IDENTIFIER, 16);
+  // 18-25 spare, left zero
+  cmd[26] = checksum(cmd);
+  cmd[27] = FRAME_END;
+  return cmd;
+}
+
+// Section III parameter table. The document's section 1.1 response table has
+// its label column drifted one row against its byte-position column; these four
+// identifiers appear in the parameter table in exactly this order and with
+// exactly these widths (AD00 is 2 bytes, AD01/AD02/AD03 are 1 each), which is
+// what pins offsets 73-77 down.
+const PAYMENT_MODES = { 0x48: 'postpaid', 0x59: 'prepaid', 0x4a: 'pre-ladder', 0x4e: 'hvac_valve' };
+const IN_PLACE_MODES = { 0x44: 'blocked_turn', 0x4b: 'switch' };
+const METERING_MODES = { 0x50: 1, 0x60: 10, 0x70: 100, 0x80: 1000 };
+
+/** Section 5, 0xAC0E: 4-byte IP then 2-byte port, high byte first. */
+function decodeServerAddress(bytes) {
+  return `${bytes[0]}.${bytes[1]}.${bytes[2]}.${bytes[3]}:${bytes.readUInt16BE(4)}`;
+}
+
+/**
+ * Section 9, 0xAD00 valve control function shielding.
+ *
+ * Each bit governs whether an alarm condition is allowed to shut the valve:
+ * "0: Valve closed, 1: Invalid". Default 0x0000 means valve control enabled.
+ */
+function decodeValveShielding(word) {
+  const shielded = (bit) => Boolean(word & (1 << bit));
+  return {
+    raw: word.toString(16).toUpperCase().padStart(4, '0'),
+    enabled: word === 0x0000,
+    shieldedConditions: [
+      shielded(4) && 'battery_power_loss',
+      shielded(5) && 'undervoltage',
+      shielded(6) && 'magnetic_interference',
+      shielded(7) && 'cover_open',
+    ].filter(Boolean),
+  };
+}
+
+/**
+ * The meter's reply to a read (protocol section 1.1, "Response").
+ *
+ * Only the fields through offset 77 are decoded. Everything past that is tiered
+ * pricing and thresholds for prepaid meters, which this postpaid meter does not
+ * use; the raw bytes are kept so nothing is lost.
+ */
+export function decodeReadResponse(buf) {
+  const frame = decodeCat1Frame(buf);
+  if (frame.control !== READ_RESPONSE_CONTROL) {
+    throw new FrameError('not_read_response', `expected control 81H, got ${frame.control.toString(16)}H`);
+  }
+  if (buf.length < 80) {
+    throw new FrameError('too_short', `read response is ${buf.length} bytes, need at least 80`);
+  }
+
+  const meteringModeByte = buf[75];
+  return {
+    ...frame,
+    // Echoed back so the response can be checked against the meter's own report
+    // -- if these match, the offsets below are reading the right bytes.
+    imei: bcdForward(buf.subarray(18, 26)).slice(0, 15),
+    imsi: bcdForward(buf.subarray(26, 34)).slice(0, 15),
+    iccid: bcdForward(buf.subarray(34, 44)),
+    hardwareVersion: buf.subarray(44, 46).toString('hex').toUpperCase(),
+    softwareVersion: buf.subarray(46, 48).toString('hex').toUpperCase(),
+    tableTypeCode: buf.subarray(48, 50).toString('hex').toUpperCase(),
+    meterConfig: decodeTableTypeCode(u16(buf, 48)),
+    vendorCode: buf.subarray(50, 52).toString('hex').toUpperCase(),
+    dailyReportLimit: buf[52],
+    serverAddress1: decodeServerAddress(buf.subarray(53, 59)),
+    serverAddress2: decodeServerAddress(buf.subarray(59, 65)),
+    cumulativeReportCount: u16(buf, 65),
+    reportingMode: decodeReportingMode(buf.subarray(67, 73)),
+    // The three that decide whether a valve write is permitted.
+    valveControl: decodeValveShielding(u16(buf, 73)),
+    meteringModeLitres: METERING_MODES[meteringModeByte] ?? null,
+    meteringModeRaw: meteringModeByte.toString(16).toUpperCase().padStart(2, '0'),
+    paymentMode: PAYMENT_MODES[buf[76]] ?? `unknown (${buf[76].toString(16).toUpperCase()}H)`,
+    inPlaceMode: IN_PLACE_MODES[buf[77]] ?? `unknown (${buf[77].toString(16).toUpperCase()}H)`,
+    rest: buf.subarray(78, buf.length - 2).toString('hex').toUpperCase(),
+  };
 }
 
 /**

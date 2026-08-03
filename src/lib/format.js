@@ -68,10 +68,36 @@ export function formatCat1Reading(reading, hex, { duplicate, source = 'tcp' }) {
     `  trigger ${reading.reportingTriggers.join(', ') || DASH}   report #${p.cumulativeReportCount} (today #${p.dailyReportCount})`,
     `  time    ${p.meterClock.iso ?? p.meterClock.raw}   (meter clock)`,
     `  usage   cumulative ${m3(p.cumulativeUsageLitres)} (${p.cumulativeUsageLitres} L)   today ${m3(p.dailyUsageLitres)}   month ${m3(p.monthlyUsageLitres)}`,
+    `  meter   ${p.meterConfig.paymentType} · ${p.meterConfig.valveType} valve · counts in ${p.meterConfig.resolutionLitres} L steps`,
     `  status  valve ${p.status.valve}   battery ${p.status.batteryUndervoltage ? 'LOW' : 'ok'} ${p.voltageVolts.toFixed(3)} V   alarms: ${alarms.join(', ') || 'none'}`,
     `  radio   ${num(p.signalStrengthDbm, 'dBm')} RSSI   ${num(p.signalQualityDb, 'dB')} RSRQ   ${num(p.snrDb, 'dB')} SNR`,
     `  sim     IMEI ${p.imei}   ICCID ${p.iccid}`,
     `  config  reports ${p.reportingMode.description ?? p.reportingMode.raw}   mfr ${p.manufacturerCode}   hw ${p.hardwareVersion}   sw ${p.softwareVersion}`,
+  ].join('\n');
+}
+
+/**
+ * CAT-1 section 1.1 read response: the meter's stored configuration.
+ *
+ * IMEI/ICCID/versions are printed first on purpose. They are already known from
+ * the meter's own reports, so if they read back correctly here then every later
+ * offset in this frame is being read from the right place -- which is the only
+ * reason to trust the valve and payment fields underneath them.
+ */
+export function formatReadResponse(r, hex, { peer }) {
+  return [
+    rule(`tcp read  ${r.address}  PARAMETERS`),
+    `  peer    ${peer}`,
+    `  raw     ${hex}`,
+    `  ident   IMEI ${r.imei}   IMSI ${r.imsi}`,
+    `          ICCID ${r.iccid}`,
+    `          hw ${r.hardwareVersion}   sw ${r.softwareVersion}   vendor ${r.vendorCode}   table type ${r.tableTypeCode}`,
+    `  valve   control ${r.valveControl.enabled ? 'ENABLED (0000, default)' : `SHIELDED (${r.valveControl.raw})`}` +
+      `${r.valveControl.shieldedConditions.length ? `   shielded on: ${r.valveControl.shieldedConditions.join(', ')}` : ''}`,
+    `  modes   payment ${r.paymentMode}   in-place ${r.inPlaceMode}   metering ${r.meteringModeLitres ?? DASH} L/count (${r.meteringModeRaw}H)`,
+    `  server  primary ${r.serverAddress1}   secondary ${r.serverAddress2}`,
+    `  reports ${r.reportingMode.description ?? r.reportingMode.raw}   daily limit ${r.dailyReportLimit}   cumulative #${r.cumulativeReportCount}`,
+    `  rest    ${r.rest}`,
   ].join('\n');
 }
 

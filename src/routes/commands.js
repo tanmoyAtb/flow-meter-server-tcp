@@ -6,7 +6,12 @@
 // has been recorded, the device has not yet acted on it.
 
 import express, { Router } from 'express';
-import { encodeSetClock, encodeSetClockParam, encodeValveOperation } from '../lib/cat1.js';
+import {
+  encodeReadParameters,
+  encodeSetClock,
+  encodeSetClockParam,
+  encodeValveOperation,
+} from '../lib/cat1.js';
 
 const ADDRESS_RE = /^\d{14}$/; // 14-digit BCD meter address
 
@@ -126,6 +131,36 @@ export function commandRouter(queue, log = console, { token = null } = {}) {
       status: 'queued',
       command: queue.get(cmd.id),
       note: "delivered at the meter's next contact; confirm via the valve status in the following report",
+    });
+  });
+
+  // Read-only, and the only command in the protocol that is. Queued the same
+  // way as the writes because the meter is asleep either way.
+  router.post('/meters/:address/read', (req, res) => {
+    const { address } = req.params;
+    if (!ADDRESS_RE.test(address)) {
+      return res.status(400).json({ ok: false, reason: 'bad_address', detail: 'expected 14 decimal digits' });
+    }
+
+    const meterTypeCode = req.body?.meterTypeCode ?? 0x10;
+    const params = { identifier: 'A901', sentTime: null, meterTypeCode };
+
+    const cmd = queue.enqueue(address, {
+      type: 'read_parameters',
+      params,
+      build: (instructionNumber) => {
+        params.sentTime = new Date().toISOString();
+        return encodeReadParameters({ meterTypeCode, address }, instructionNumber);
+      },
+    });
+
+    log.info?.(`command queued: read_parameters #${cmd.id} for ${address}`);
+
+    return res.status(202).json({
+      ok: true,
+      status: 'queued',
+      command: queue.get(cmd.id),
+      note: "delivered at the meter's next contact; the parameter dump appears in the log",
     });
   });
 
