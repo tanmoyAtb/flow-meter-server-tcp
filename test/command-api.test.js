@@ -173,3 +173,29 @@ test('ingest routes keep working alongside the command API', async (t) => {
   // The token guard must not leak onto the meter-facing endpoints.
   assert.equal((await fetch(`${base}/health`)).status, 200);
 });
+
+test('an unknown time zone is rejected before anything is queued', async (t) => {
+  const { base, commands, server } = await serve();
+  t.after(() => server.close());
+
+  const res = await queueTime(base, { timeZone: 'Mars/Olympus_Mons' });
+  assert.equal(res.status, 400);
+  assert.equal((await res.json()).reason, 'bad_timezone');
+  assert.equal(commands.list().length, 0);
+});
+
+test('the queued frame carries the requested zone, resolved at delivery', async (t) => {
+  const { base, commands, server } = await serve();
+  t.after(() => server.close());
+
+  await queueTime(base, { timeZone: 'Asia/Dhaka' });
+  const cmd = commands.nextFor(ADDRESS);
+  assert.equal(commands.get(cmd.id).params.timeZone, 'Asia/Dhaka');
+
+  const hours = Number(clockOf(cmd.build(1)).slice(6, 8));
+  const dhakaHour = Number(
+    new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Dhaka', hour: '2-digit', hourCycle: 'h23' })
+      .format(new Date()),
+  );
+  assert.equal(hours, dhakaHour);
+});

@@ -194,3 +194,38 @@ test('the fallback does not guess when several commands are outstanding', () => 
   // An exact instruction number still matches precisely.
   assert.equal(queue.findSentByInstruction(DEVICE_METER_ADDRESS, b.instructionNumber).id, b.id);
 });
+
+// --- wall clock the digits represent (the meter has no timezone) -----------
+
+test('a time zone shifts the digits, without changing the instant', () => {
+  // 2026-08-03T10:40:05Z is 16:40:05 in Dhaka (UTC+6).
+  const utc = encodeSetClockParam(target, when, 1);
+  const dhaka = encodeSetClockParam(target, when, 1, { timeZone: 'Asia/Dhaka' });
+  assert.equal(utc.subarray(18, 24).toString('hex'), '260803104005');
+  assert.equal(dhaka.subarray(18, 24).toString('hex'), '260803164005');
+  assert.equal(dhaka.at(-2), checksum(dhaka));
+});
+
+test('the AA00 form takes the same time zone, at its own offset', () => {
+  const dhaka = encodeSetClock(target, when, 1, { timeZone: 'Asia/Dhaka' });
+  assert.equal(dhaka[18], 0x5a); // calibration enable still first
+  assert.equal(dhaka.subarray(19, 25).toString('hex'), '260803164005');
+});
+
+test('omitting the time zone keeps UTC, so existing behaviour is unchanged', () => {
+  assert.deepEqual(encodeSetClockParam(target, when, 1, {}), encodeSetClockParam(target, when, 1));
+});
+
+test('a date that rolls over in the target zone rolls the digits too', () => {
+  // 22:30 UTC is 04:30 the next day in Dhaka.
+  const late = new Date('2026-08-03T22:30:00Z');
+  const dhaka = encodeSetClockParam(target, late, 1, { timeZone: 'Asia/Dhaka' });
+  assert.equal(dhaka.subarray(18, 24).toString('hex'), '260804043000');
+});
+
+test('midnight is 00 rather than 24 in the target zone', () => {
+  // 18:00 UTC is exactly 00:00 next day in Dhaka.
+  const midnight = new Date('2026-08-03T18:00:00Z');
+  const dhaka = encodeSetClockParam(target, midnight, 1, { timeZone: 'Asia/Dhaka' });
+  assert.equal(dhaka.subarray(18, 24).toString('hex'), '260804000000');
+});

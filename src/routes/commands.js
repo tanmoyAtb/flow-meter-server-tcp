@@ -61,11 +61,28 @@ export function commandRouter(queue, log = console, { token = null } = {}) {
       });
     }
 
+    // The meter stores digits, not an instant, so the caller says which wall
+    // clock they should be. Resolved at delivery like `now`, so a command that
+    // waits a day still lands on the right local time.
+    const timeZone = req.body?.timeZone ?? null;
+    if (timeZone !== null) {
+      try {
+        new Intl.DateTimeFormat('en-GB', { timeZone });
+      } catch {
+        return res.status(400).json({
+          ok: false,
+          reason: 'bad_timezone',
+          detail: `unknown time zone ${JSON.stringify(timeZone)}`,
+        });
+      }
+    }
+
     const meterTypeCode = req.body?.meterTypeCode ?? 0x10;
     // Held by reference so the resolved value shows up in the command's status.
     const params = {
       mode: explicit ? 'explicit' : 'now_at_delivery',
       method,
+      timeZone: timeZone ?? 'UTC',
       time: explicit ? explicit.toISOString() : null,
       sentTime: null,
       meterTypeCode,
@@ -77,12 +94,12 @@ export function commandRouter(queue, log = console, { token = null } = {}) {
       build: (instructionNumber) => {
         const at = explicit ?? new Date();
         params.sentTime = at.toISOString();
-        return encode({ meterTypeCode, address }, at, instructionNumber);
+        return encode({ meterTypeCode, address }, at, instructionNumber, { timeZone });
       },
     });
 
     log.info?.(
-      `command queued: set_clock #${cmd.id} for ${address} -> ${explicit ? explicit.toISOString() : 'now, resolved at delivery'}`,
+      `command queued: set_clock #${cmd.id} for ${address} -> ${explicit ? explicit.toISOString() : 'now, resolved at delivery'} (${timeZone ?? 'UTC'})`,
     );
 
     return res.status(202).json({

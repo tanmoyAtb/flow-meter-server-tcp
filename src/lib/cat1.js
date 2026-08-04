@@ -313,6 +313,40 @@ function addressBytes(address) {
 const toBcd = (n) => ((Math.floor(n / 10) % 10) << 4) | (n % 10);
 
 /**
+ * The six clock digits, as the wall clock of a given zone.
+ *
+ * The meter has no timezone concept -- it stores exactly the digits it is sent
+ * and reports them back unchanged. So the caller decides which wall clock those
+ * digits represent; `timeZone` null means UTC. Using an IANA zone rather than a
+ * fixed offset means a region that starts observing DST keeps working (Dhaka is
+ * UTC+6 today, but did run DST in 2009).
+ */
+function clockParts(when, timeZone) {
+  if (!timeZone) {
+    return [
+      when.getUTCFullYear() % 100,
+      when.getUTCMonth() + 1,
+      when.getUTCDate(),
+      when.getUTCHours(),
+      when.getUTCMinutes(),
+      when.getUTCSeconds(),
+    ];
+  }
+  const parts = new Intl.DateTimeFormat('en-GB', {
+    timeZone,
+    year: '2-digit',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23', // 00-23, so midnight is 00 rather than 24
+  }).formatToParts(when);
+  const at = (type) => Number(parts.find((x) => x.type === type).value);
+  return [at('year'), at('month'), at('day'), at('hour'), at('minute'), at('second')];
+}
+
+/**
  * Byte 9 is 03H, per section I.3 "Equipment type: Fixed at 0x03" and every
  * command table in the document.
  *
@@ -365,15 +399,12 @@ function sealCommand(cmd) {
  * meter has no timezone concept -- it stores exactly what it is given, so the
  * caller decides whether that is UTC or local.
  */
-export function encodeSetClock({ meterTypeCode = 0x10, address }, when, instructionNumber) {
+export function encodeSetClock({ meterTypeCode = 0x10, address }, when, instructionNumber, { timeZone = null } = {}) {
   const cmd = commandFrame({ meterTypeCode, address }, WRITE_CONTROL, 0xaa00, instructionNumber, 0x11);
   cmd[18] = 0x5a; // enable
-  cmd[19] = toBcd(when.getUTCFullYear() % 100);
-  cmd[20] = toBcd(when.getUTCMonth() + 1);
-  cmd[21] = toBcd(when.getUTCDate());
-  cmd[22] = toBcd(when.getUTCHours());
-  cmd[23] = toBcd(when.getUTCMinutes());
-  cmd[24] = toBcd(when.getUTCSeconds());
+  clockParts(when, timeZone).forEach((v, i) => {
+    cmd[19 + i] = toBcd(v);
+  });
   return sealCommand(cmd);
 }
 
@@ -391,14 +422,11 @@ export function encodeSetClock({ meterTypeCode = 0x10, address }, when, instruct
  * may only be valid inside that sequence. This form uses the documented
  * read/write parameter instead.
  */
-export function encodeSetClockParam({ meterTypeCode = 0x10, address }, when, instructionNumber) {
+export function encodeSetClockParam({ meterTypeCode = 0x10, address }, when, instructionNumber, { timeZone = null } = {}) {
   const cmd = commandFrame({ meterTypeCode, address }, WRITE_CONTROL, 0xac12, instructionNumber, 0x08);
-  cmd[18] = toBcd(when.getUTCFullYear() % 100);
-  cmd[19] = toBcd(when.getUTCMonth() + 1);
-  cmd[20] = toBcd(when.getUTCDate());
-  cmd[21] = toBcd(when.getUTCHours());
-  cmd[22] = toBcd(when.getUTCMinutes());
-  cmd[23] = toBcd(when.getUTCSeconds());
+  clockParts(when, timeZone).forEach((v, i) => {
+    cmd[18 + i] = toBcd(v);
+  });
   return sealCommand(cmd);
 }
 
