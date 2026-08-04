@@ -188,10 +188,16 @@ export function createMeterConnectionHandler(
      * Once the meter has answered, either send the next queued command while it
      * is still awake, or tell it to sleep. Without this it sits with the radio
      * on until the idle timeout fires.
+     *
+     * Nothing follows a refusal. Observed 2026-08-04: a refused AC12 clock write
+     * was followed by a valve command that had succeeded on its own minutes
+     * earlier, and it was refused too. This firmware appears to abandon the
+     * session on the first error, so chaining past one only costs battery and
+     * marks good commands failed.
      */
-    const finishExchange = () => {
+    const finishExchange = (ok) => {
       if (!openReport) return;
-      const next = commands?.nextFor(openReport.address) ?? null;
+      const next = ok ? commands?.nextFor(openReport.address) ?? null : null;
       if (next) return sendCommand(next, openReport);
       sendAck(openReport, { powerOff: true });
       openReport = null;
@@ -219,7 +225,7 @@ export function createMeterConnectionHandler(
         }),
       );
       log.info?.(formatTcpEvent('command reply raw', { peer, detail: hex }));
-      finishExchange();
+      finishExchange(response.success);
     };
 
     /**
@@ -231,7 +237,7 @@ export function createMeterConnectionHandler(
       const cmd = commands?.findSentByInstruction(response.address, response.instructionNumber);
       if (cmd) commands.complete(cmd, { success: true, detail: 'parameters returned' });
       log.info?.(formatReadResponse(response, hex, { peer }));
-      finishExchange();
+      finishExchange(true);
     };
 
     const decodeCjt188 = (frame, hex) => {

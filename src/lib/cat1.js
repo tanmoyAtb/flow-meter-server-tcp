@@ -468,6 +468,65 @@ export function encodeValveOperation(
   return sealCommand(cmd);
 }
 
+// --- metering resolution and the other meter-type bytes -------------------
+
+/**
+ * Section III, "Mounting parameter". These are the three mode bytes AA07 writes
+ * and the same values a read response reports back, so both directions share
+ * one definition.
+ *
+ * The metering mode is the reading precision: a 1000 L meter only increments
+ * once a whole cubic metre has passed, which is why this meter's total sat
+ * frozen at 1000 L until the vendor moved it to 10 L.
+ */
+export const METERING_MODE_BYTES = { 1: 0x50, 10: 0x60, 100: 0x70, 1000: 0x80 };
+export const PAYMENT_MODE_BYTES = { postpaid: 0x48, prepaid: 0x59, 'pre-ladder': 0x4a, hvac_valve: 0x4e };
+export const IN_PLACE_MODE_BYTES = { blocked_turn: 0x44, switch: 0x4b };
+
+/**
+ * Section 2.8 states m = 0DH, but its own byte table runs the data field from
+ * the identifier at 16 to the spare ending at 39, with CS at 40 -- that is 18H.
+ * The vendor's accepted frame uses 18H, so the byte positions are right and the
+ * stated length is not. Same contradiction the valve command has, resolved the
+ * same way.
+ */
+export const METER_TYPE_DATA_LENGTH = 0x18;
+
+/**
+ * Set the meter type: metering resolution, payment mode, valve type
+ * (protocol section 2.8, data identifier AA07H).
+ *
+ *   68 | T | A6-A0 | 03 | 04 | instruction no. | 0000 | 18H | AA07 |
+ *   metering | paid | in-place | addr gate | new address(7) |
+ *   mfr gate | new mfr(2) | spare(8) | CS | 16            -- 42 bytes, m = 18H
+ *
+ * Bytes 21 and 29 are the gates that let the rest of the frame rewrite the
+ * meter's address and manufacturer code (0xC1 and 0xC3 respectively). They are
+ * held at zero and not exposed: this command exists to change the reading
+ * precision, and a mistyped field here would change the meter's identity, after
+ * which we could no longer address it at all.
+ *
+ * There is no "leave unchanged" value for the two modes that ride along with
+ * the metering mode, so the caller has to restate them. The defaults are what
+ * this meter already is (and what the vendor's own accepted frame carries).
+ */
+export function encodeSetMeterType(
+  { meterTypeCode = 0x10, address },
+  {
+    meteringMode,
+    paymentMode = PAYMENT_MODE_BYTES.postpaid,
+    inPlaceMode = IN_PLACE_MODE_BYTES.switch,
+    dataLength = METER_TYPE_DATA_LENGTH,
+  },
+  instructionNumber,
+) {
+  const cmd = commandFrame({ meterTypeCode, address }, WRITE_CONTROL, 0xaa07, instructionNumber, dataLength);
+  cmd[18] = meteringMode;
+  cmd[19] = paymentMode;
+  cmd[20] = inPlaceMode;
+  return sealCommand(cmd);
+}
+
 // --- reading the meter's configuration (protocol section 1.1) -------------
 
 export const READ_CONTROL = 0x01; // server issues a read command
@@ -497,9 +556,12 @@ export function encodeReadParameters({ meterTypeCode = 0x10, address }, instruct
 // identifiers appear in the parameter table in exactly this order and with
 // exactly these widths (AD00 is 2 bytes, AD01/AD02/AD03 are 1 each), which is
 // what pins offsets 73-77 down.
-const PAYMENT_MODES = { 0x48: 'postpaid', 0x59: 'prepaid', 0x4a: 'pre-ladder', 0x4e: 'hvac_valve' };
-const IN_PLACE_MODES = { 0x44: 'blocked_turn', 0x4b: 'switch' };
-const METERING_MODES = { 0x50: 1, 0x60: 10, 0x70: 100, 0x80: 1000 };
+const byByte = (map, value = (name) => name) =>
+  Object.fromEntries(Object.entries(map).map(([name, byte]) => [byte, value(name)]));
+
+const PAYMENT_MODES = byByte(PAYMENT_MODE_BYTES);
+const IN_PLACE_MODES = byByte(IN_PLACE_MODE_BYTES);
+const METERING_MODES = byByte(METERING_MODE_BYTES, Number);
 
 /** Section 5, 0xAC0E: 4-byte IP then 2-byte port, high byte first. */
 function decodeServerAddress(bytes) {

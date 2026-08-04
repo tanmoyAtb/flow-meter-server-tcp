@@ -10,7 +10,11 @@ import {
   encodeReadParameters,
   encodeSetClock,
   encodeSetClockParam,
+  encodeSetMeterType,
   encodeValveOperation,
+  METERING_MODE_BYTES,
+  PAYMENT_MODE_BYTES,
+  IN_PLACE_MODE_BYTES,
 } from '../lib/cat1.js';
 
 const ADDRESS_RE = /^\d{14}$/; // 14-digit BCD meter address
@@ -160,6 +164,86 @@ export function commandRouter(queue, log = console, { token = null } = {}) {
       status: 'queued',
       command: queue.get(cmd.id),
       note: "delivered at the meter's next contact; confirm via the valve status in the following report",
+    });
+  });
+
+  // Reading precision. The meter counts in whole units of its metering mode, so
+  // at 1000 L a tap running for an hour can leave every usage field unchanged.
+  router.post('/meters/:address/metering', (req, res) => {
+    const { address } = req.params;
+    if (!ADDRESS_RE.test(address)) {
+      return res.status(400).json({ ok: false, reason: 'bad_address', detail: 'expected 14 decimal digits' });
+    }
+
+    // Required, like the valve state: there is no resolution that is right by
+    // default, and getting it wrong makes the readings quietly useless.
+    // Not coerced: object keys are strings, so "10" would otherwise be accepted
+    // silently, and the rest of this API rejects the wrong type rather than
+    // guessing what the caller meant.
+    const resolutionLitres = req.body?.resolutionLitres;
+    const meteringMode = typeof resolutionLitres === 'number' ? METERING_MODE_BYTES[resolutionLitres] : undefined;
+    if (meteringMode === undefined) {
+      return res.status(400).json({
+        ok: false,
+        reason: 'bad_resolution',
+        detail: `resolutionLitres must be one of ${Object.keys(METERING_MODE_BYTES).join(', ')}`,
+      });
+    }
+
+    // AA07 writes all three modes at once, so the two that are not being
+    // changed have to be restated. Defaults match this meter as configured.
+    const paymentModeName = req.body?.paymentMode ?? 'postpaid';
+    const paymentMode = PAYMENT_MODE_BYTES[paymentModeName];
+    if (paymentMode === undefined) {
+      return res.status(400).json({
+        ok: false,
+        reason: 'bad_payment_mode',
+        detail: `paymentMode must be one of ${Object.keys(PAYMENT_MODE_BYTES).join(', ')}`,
+      });
+    }
+
+    const inPlaceModeName = req.body?.inPlaceMode ?? 'switch';
+    const inPlaceMode = IN_PLACE_MODE_BYTES[inPlaceModeName];
+    if (inPlaceMode === undefined) {
+      return res.status(400).json({
+        ok: false,
+        reason: 'bad_in_place_mode',
+        detail: `inPlaceMode must be one of ${Object.keys(IN_PLACE_MODE_BYTES).join(', ')}`,
+      });
+    }
+
+    const meterTypeCode = req.body?.meterTypeCode ?? 0x10;
+    const params = {
+      resolutionLitres,
+      paymentMode: paymentModeName,
+      inPlaceMode: inPlaceModeName,
+      sentTime: null,
+      meterTypeCode,
+    };
+
+    const cmd = queue.enqueue(address, {
+      type: 'set_meter_type',
+      params,
+      build: (instructionNumber) => {
+        params.sentTime = new Date().toISOString();
+        return encodeSetMeterType(
+          { meterTypeCode, address },
+          { meteringMode, paymentMode, inPlaceMode },
+          instructionNumber,
+        );
+      },
+    });
+
+    log.info?.(
+      `command queued: set_meter_type #${cmd.id} for ${address} -> ${resolutionLitres} L resolution` +
+        ` (${paymentModeName}, ${inPlaceModeName})`,
+    );
+
+    return res.status(202).json({
+      ok: true,
+      status: 'queued',
+      command: queue.get(cmd.id),
+      note: "delivered at the meter's next contact; confirm via the table type code in the following report",
     });
   });
 

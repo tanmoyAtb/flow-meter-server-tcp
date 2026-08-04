@@ -17,8 +17,14 @@ import { CAT1_FRAME, DEVICE_METER_ADDRESS } from './fixtures.js';
 
 const silent = { info: () => {}, warn: () => {}, error: () => {} };
 
-/** The meter's real refusal of valve command instruction 1, from the logs. */
+/** The meter's real acceptance of valve command instruction 1, from the logs. */
 const WRITE_RESPONSE = Buffer.from(
+  '68100400220826100003840001000011AA05002608041626380000000000000000CA16',
+  'hex',
+);
+
+/** And its refusal of the same, success byte 0BH. */
+const REFUSED_RESPONSE = Buffer.from(
   '68100400220826100003840001000011AA050B2608041602330000000000000000AC16',
   'hex',
 );
@@ -124,6 +130,21 @@ test('a second queued command goes out instead of the power-off ack', () => {
   assert.ok(!isAck(socket.writes[1]));
   assert.equal(identifierOf(socket.writes[1]), 0xaa05);
   assert.equal(socket.writes[1][18], 0x55); // the second command: open
+});
+
+test('a refusal stops the queue rather than chaining into it', () => {
+  // The meter abandons the session after an error, so a following command would
+  // be refused too and marked failed for a fault that is not its own.
+  const commands = createCommandQueue();
+  queueValve(commands, false);
+  queueValve(commands, true);
+  const socket = connect({ commands });
+  socket.emit('data', CAT1_FRAME);
+  socket.emit('data', REFUSED_RESPONSE);
+
+  assert.equal(socket.writes.length, 2);
+  assert.ok(isAck(socket.writes[1])); // power-off, not the second command
+  assert.equal(commands.list()[1].status, 'queued'); // still pending, untouched
 });
 
 test('no acknowledgement is sent if the meter never replies', () => {
