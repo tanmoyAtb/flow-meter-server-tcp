@@ -22,13 +22,13 @@ const target = { meterTypeCode: 0x10, address: DEVICE_METER_ADDRESS };
 
 test('read command matches the documented layout', () => {
   const cmd = encodeReadParameters(target, 0x0007);
-  assert.equal(cmd.length, 28);
+  assert.equal(cmd.length, 28); // section 1.1: CS at 26, end frame at 27
   assert.equal(cmd[0], 0x68);
-  assert.equal(cmd[9], 0x03);
+  assert.equal(cmd[9], 0x01); // server-originated, not the document's 03H
   assert.equal(cmd[10], READ_CONTROL); // 01H, not the 04H used by writes
   assert.equal(cmd.readUInt16BE(11), 0x0007);
   assert.equal(cmd.readUInt16BE(13), 0x0000); // spare
-  assert.equal(cmd[15], 0x0a); // data length 10 = identifier(2) + spare(8)
+  assert.equal(cmd[15], 0x0a); // section 1.1 data length 10 = identifier(2) + spare(8)
   assert.equal(cmd.readUInt16BE(16), READ_ALL_IDENTIFIER); // A901H
   assert.equal(cmd.subarray(18, 26).toString('hex'), '0000000000000000');
   assert.equal(cmd.at(-2), checksum(cmd));

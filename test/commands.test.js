@@ -19,13 +19,13 @@ const when = new Date(Date.UTC(2026, 7, 3, 10, 40, 5)); // 2026-08-03 10:40:05
 
 test('clock command matches the documented layout', () => {
   const cmd = encodeSetClock(target, when, 0x1234);
-  assert.equal(cmd.length, 35);
+  assert.equal(cmd.length, 35); // section 2.1: CS at 33, end frame at 34
   assert.equal(cmd[0], 0x68);
-  assert.equal(cmd[9], 0x03); // device type
+  assert.equal(cmd[9], 0x01); // server-originated, not the document's 03H
   assert.equal(cmd[10], WRITE_CONTROL); // 04H, server write
   assert.equal(cmd.readUInt16BE(11), 0x1234); // instruction number
   assert.equal(cmd.readUInt16BE(13), 0x0000); // spare
-  assert.equal(cmd[15], 0x11); // data length 17
+  assert.equal(cmd[15], 0x11); // section 2.1 data length 17
   assert.equal(cmd.readUInt16BE(16), 0xaa00); // data identifier
   assert.equal(cmd[18], 0x5a); // calibration enable
   assert.equal(cmd.at(-1), 0x16);
@@ -158,7 +158,8 @@ test('the queue never leaks the frame builder to callers', () => {
 
 test('AC12 clock write matches the generic section 2 parameter layout', () => {
   const cmd = encodeSetClockParam(target, when, 0x2211);
-  assert.equal(cmd.length, 26);
+  assert.equal(cmd.length, 26); // section 2 generic write: identifier(2) + clock(6)
+  assert.equal(cmd[9], 0x01);
   assert.equal(cmd[10], WRITE_CONTROL);
   assert.equal(cmd.readUInt16BE(11), 0x2211);
   assert.equal(cmd[15], 0x08); // identifier(2) + clock(6)

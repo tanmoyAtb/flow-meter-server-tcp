@@ -305,9 +305,56 @@ function addressBytes(address) {
 const toBcd = (n) => ((Math.floor(n / 10) % 10) << 4) | (n % 10);
 
 /**
+ * Byte 9 of a frame the *server* originates.
+ *
+ * CAT1_DEVICE_TYPE (03H) came from watching the meter's reports, and we reused
+ * it for commands on the assumption it identified the device. It does not: 03H
+ * is what the *meter* stamps on its own frames. A known-good command captured
+ * from the vendor's server carries 01H here, and every command we sent with 03H
+ * was refused with 0BH regardless of identifier or control code -- which is the
+ * signature of a field checked before the payload is ever looked at.
+ *
+ * Acknowledgements are deliberately left on 03H: the meter demonstrably honours
+ * them (it sleeps on AFH and stays awake on 00H), and there is no reason to
+ * disturb the one server-to-meter frame that already works.
+ */
+export const CAT1_SERVER_DEVICE_TYPE = 0x01;
+
+/**
+ * The header every server-originated command shares, with the data field
+ * allocated but empty. Callers fill in from offset 18 and call sealCommand.
+ *
+ * `dataLength` is per-identifier and comes straight from the document's byte
+ * tables -- 0AH for A901 (section 1.1), 0CH for AA05 (2.6), 11H for AA00 (2.1).
+ * The vendor's AA07 frame uses 18H because section 2.8 gives *that* command a
+ * 24-byte data field ending at byte 39, not because commands are padded to a
+ * fixed width. Generalising its length to every command was wrong.
+ */
+function commandFrame({ meterTypeCode = 0x10, address }, control, identifier, instructionNumber, dataLength) {
+  const cmd = Buffer.alloc(HEADER_BYTES + dataLength + 2);
+  cmd[0] = FRAME_START;
+  cmd[1] = meterTypeCode;
+  addressBytes(address).copy(cmd, 2);
+  cmd[9] = CAT1_SERVER_DEVICE_TYPE;
+  cmd[10] = control;
+  cmd.writeUInt16BE(instructionNumber & 0xffff, 11);
+  cmd.writeUInt16BE(0x0000, 13); // spare
+  cmd[15] = dataLength;
+  cmd.writeUInt16BE(identifier, 16);
+  return cmd;
+}
+
+/** Checksum covers everything from 68H up to but not including CS (section I.9). */
+function sealCommand(cmd) {
+  cmd[cmd.length - 2] = checksum(cmd);
+  cmd[cmd.length - 1] = FRAME_END;
+  return cmd;
+}
+
+/**
  * Clock calibration write (protocol section 2.1, data identifier AA00H).
  *
- *   68 | T | A6-A0 | 03 | 04 | instruction no. | 0000 | 11H | AA00 |
+ *   68 | T | A6-A0 | 01 | 04 | instruction no. | 0000 | 11H | AA00 |
  *   5A | YY MM DD HH MM SS | backup(8) | CS | 16          -- 35 bytes, m = 11H
  *
  * Byte 18 is the calibration enable: 5AH performs the calibration, anything
@@ -316,16 +363,7 @@ const toBcd = (n) => ((Math.floor(n / 10) % 10) << 4) | (n % 10);
  * caller decides whether that is UTC or local.
  */
 export function encodeSetClock({ meterTypeCode = 0x10, address }, when, instructionNumber) {
-  const cmd = Buffer.alloc(35);
-  cmd[0] = FRAME_START;
-  cmd[1] = meterTypeCode;
-  addressBytes(address).copy(cmd, 2);
-  cmd[9] = CAT1_DEVICE_TYPE;
-  cmd[10] = WRITE_CONTROL;
-  cmd.writeUInt16BE(instructionNumber & 0xffff, 11);
-  cmd.writeUInt16BE(0x0000, 13); // spare
-  cmd[15] = 0x11; // data length: 17 bytes, offsets 16..32
-  cmd.writeUInt16BE(0xaa00, 16); // data identifier: clock calibration
+  const cmd = commandFrame({ meterTypeCode, address }, WRITE_CONTROL, 0xaa00, instructionNumber, 0x11);
   cmd[18] = 0x5a; // enable
   cmd[19] = toBcd(when.getUTCFullYear() % 100);
   cmd[20] = toBcd(when.getUTCMonth() + 1);
@@ -333,17 +371,14 @@ export function encodeSetClock({ meterTypeCode = 0x10, address }, when, instruct
   cmd[22] = toBcd(when.getUTCHours());
   cmd[23] = toBcd(when.getUTCMinutes());
   cmd[24] = toBcd(when.getUTCSeconds());
-  // 25-32 backup, left zero
-  cmd[33] = checksum(cmd);
-  cmd[34] = FRAME_END;
-  return cmd;
+  return sealCommand(cmd);
 }
 
 /**
  * Clock calibration via the generic parameter write (protocol section 2, with
  * data identifier 0xAC12 "Real-Time Clock, BCD, 6 bytes, R/W" from section III).
  *
- *   68 | T | A6-A0 | 03 | 04 | instruction no. | 0000 | 08H | AC12 |
+ *   68 | T | A6-A0 | 01 | 04 | instruction no. | 0000 | 08H | AC12 |
  *   YY MM DD HH MM SS | CS | 16                          -- 26 bytes, m = 8
  *
  * An alternative to the AA00H form: a real meter rejected AA00H with error 0BH
@@ -354,25 +389,14 @@ export function encodeSetClock({ meterTypeCode = 0x10, address }, when, instruct
  * read/write parameter instead.
  */
 export function encodeSetClockParam({ meterTypeCode = 0x10, address }, when, instructionNumber) {
-  const cmd = Buffer.alloc(26);
-  cmd[0] = FRAME_START;
-  cmd[1] = meterTypeCode;
-  addressBytes(address).copy(cmd, 2);
-  cmd[9] = CAT1_DEVICE_TYPE;
-  cmd[10] = WRITE_CONTROL;
-  cmd.writeUInt16BE(instructionNumber & 0xffff, 11);
-  cmd.writeUInt16BE(0x0000, 13); // spare
-  cmd[15] = 0x08; // data length: identifier(2) + clock(6)
-  cmd.writeUInt16BE(0xac12, 16); // data identifier: real-time clock
+  const cmd = commandFrame({ meterTypeCode, address }, WRITE_CONTROL, 0xac12, instructionNumber, 0x08);
   cmd[18] = toBcd(when.getUTCFullYear() % 100);
   cmd[19] = toBcd(when.getUTCMonth() + 1);
   cmd[20] = toBcd(when.getUTCDate());
   cmd[21] = toBcd(when.getUTCHours());
   cmd[22] = toBcd(when.getUTCMinutes());
   cmd[23] = toBcd(when.getUTCSeconds());
-  cmd[24] = checksum(cmd);
-  cmd[25] = FRAME_END;
-  return cmd;
+  return sealCommand(cmd);
 }
 
 // Section 23.2, data identifier AA05H.
@@ -384,7 +408,7 @@ export const VALVE_NOT_FORCED = 0x00;
 /**
  * Valve open/close (protocol section 2.6, data identifier AA05H).
  *
- *   68 | T | A6-A0 | 03 | 04 | instruction no. | 0000 | 0CH | AA05 |
+ *   68 | T | A6-A0 | 01 | 04 | instruction no. | 0000 | 0CH | AA05 |
  *   operation | permission | spare(8) | CS | 16          -- 30 bytes, m = 0CH
  *
  * Byte 18 is the operation (55H open, 99H close) and byte 19 the permission:
@@ -393,22 +417,10 @@ export const VALVE_NOT_FORCED = 0x00;
  * is safe in every installation.
  */
 export function encodeValveOperation({ meterTypeCode = 0x10, address }, { open, forced = false }, instructionNumber) {
-  const cmd = Buffer.alloc(30);
-  cmd[0] = FRAME_START;
-  cmd[1] = meterTypeCode;
-  addressBytes(address).copy(cmd, 2);
-  cmd[9] = CAT1_DEVICE_TYPE;
-  cmd[10] = WRITE_CONTROL;
-  cmd.writeUInt16BE(instructionNumber & 0xffff, 11);
-  cmd.writeUInt16BE(0x0000, 13); // spare
-  cmd[15] = 0x0c; // data length: identifier(2) + operation + permission + spare(8)
-  cmd.writeUInt16BE(0xaa05, 16); // data identifier: valve operation
+  const cmd = commandFrame({ meterTypeCode, address }, WRITE_CONTROL, 0xaa05, instructionNumber, 0x0c);
   cmd[18] = open ? VALVE_OPEN : VALVE_CLOSED;
   cmd[19] = forced ? VALVE_FORCED : VALVE_NOT_FORCED;
-  // 20-27 spare, left zero
-  cmd[28] = checksum(cmd);
-  cmd[29] = FRAME_END;
-  return cmd;
+  return sealCommand(cmd);
 }
 
 // --- reading the meter's configuration (protocol section 1.1) -------------
@@ -430,20 +442,9 @@ export const READ_ALL_IDENTIFIER = 0xa901; // the one documented read: dump para
  * decide whether a valve command is allowed to act at all.
  */
 export function encodeReadParameters({ meterTypeCode = 0x10, address }, instructionNumber) {
-  const cmd = Buffer.alloc(28);
-  cmd[0] = FRAME_START;
-  cmd[1] = meterTypeCode;
-  addressBytes(address).copy(cmd, 2);
-  cmd[9] = CAT1_DEVICE_TYPE;
-  cmd[10] = READ_CONTROL;
-  cmd.writeUInt16BE(instructionNumber & 0xffff, 11);
-  cmd.writeUInt16BE(0x0000, 13); // spare
-  cmd[15] = 0x0a; // data length: identifier(2) + spare(8)
-  cmd.writeUInt16BE(READ_ALL_IDENTIFIER, 16);
-  // 18-25 spare, left zero
-  cmd[26] = checksum(cmd);
-  cmd[27] = FRAME_END;
-  return cmd;
+  const cmd = commandFrame({ meterTypeCode, address }, READ_CONTROL, READ_ALL_IDENTIFIER, instructionNumber, 0x0a);
+  // 18-25 spare, left zero: the identifier is the whole request.
+  return sealCommand(cmd);
 }
 
 // Section III parameter table. The document's section 1.1 response table has

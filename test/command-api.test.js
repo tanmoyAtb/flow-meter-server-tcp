@@ -30,7 +30,10 @@ const queueTime = (base, body) =>
  * calibration-enable byte first (clock at 19), AC12 does not (clock at 18).
  */
 function clockOf(frame) {
-  const at = frame.length === 35 ? 19 : 18;
+  // AA00 spends byte 18 on the calibration-enable flag (section 2.1), AC12
+  // does not (section 2 generic write). The identifier is the reliable
+  // discriminator.
+  const at = frame.readUInt16BE(16) === 0xaa00 ? 19 : 18;
   return frame.subarray(at, at + 6).toString('hex');
 }
 
