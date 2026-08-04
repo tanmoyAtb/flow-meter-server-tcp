@@ -34,15 +34,53 @@ import {
 // timeout their sockets accumulate until the process runs out of handles.
 const IDLE_TIMEOUT_MS = 120_000;
 
-export function createMeterConnectionHandler(store, log = console, { commands = null } = {}) {
+/**
+ * Gap between the acknowledgement and the command that follows it.
+ *
+ * Writing both in the same tick lets Nagle coalesce them into a single TCP
+ * segment, so the meter sees the ack and the command arrive as one delivery --
+ * which no real server would produce, since a queue lookup sits between them.
+ * This meter accepts a byte-identical command frame from the vendor's server
+ * and refuses ours with 0BH, and after ruling out every field in the frame,
+ * arrival timing is the last difference left on our side of the wire.
+ */
+const COMMAND_DELAY_MS = Number(process.env.COMMAND_DELAY_MS ?? 300);
+
+/**
+ * Whether to acknowledge a report before sending a queued command.
+ *
+ * Section 3 says to: acknowledge with the power-off flag at 00H so the meter
+ * "will extend the waiting time to wait for instructions". But this meter
+ * answers that acknowledgement with an 84H frame carrying 0BH -- and once the
+ * command was delayed by 300ms it became clear that error arrives *before* the
+ * command is even sent. It is the ack being refused, not the command. With the
+ * flag at AFH the meter says nothing at all.
+ *
+ * So when something is queued we now skip the acknowledgement, send the command
+ * on its own, and acknowledge with AFH after the reply. Set ACK_BEFORE_COMMAND=1
+ * to restore the documented order without a redeploy.
+ */
+const ACK_BEFORE_COMMAND = process.env.ACK_BEFORE_COMMAND === '1';
+
+export function createMeterConnectionHandler(
+  store,
+  log = console,
+  { commands = null, commandDelayMs = COMMAND_DELAY_MS, ackBeforeCommand = ACK_BEFORE_COMMAND } = {},
+) {
   return function handleConnection(socket) {
     const peer = `${socket.remoteAddress}:${socket.remotePort}`;
     const splitter = new FrameSplitter();
     let frames = 0;
     let bytes = 0;
 
+    // Held so the exchange can be closed off with a power-off ack once the
+    // meter has answered the last command.
+    let openReport = null;
+
     log.info?.(formatTcpEvent('open', { peer }));
     socket.setTimeout(IDLE_TIMEOUT_MS);
+    // Keep the ack in its own segment rather than letting it wait for company.
+    socket.setNoDelay?.(true);
 
     const handle = (event) => {
       if (event.type === 'unframed') {
@@ -76,15 +114,23 @@ export function createMeterConnectionHandler(store, log = console, { commands = 
         throw new FrameError('unexpected_control', `control ${envelope.controlName} is not handled here`);
       }
 
-      // A queued command can only be delivered while the meter is awake, and it
-      // only stays awake if the acknowledgement says so. So the queue has to be
-      // consulted before the ack is built, not after.
+      // The queue has to be consulted before anything is written back, because
+      // what we send depends on whether a command is waiting.
       const pending = commands?.nextFor(envelope.address) ?? null;
 
-      // Acknowledge before decoding the payload: a packet type we cannot read
-      // must still be acknowledged, or an unsupported report costs battery.
-      sendAck(envelope, { powerOff: !pending });
-      if (pending) sendCommand(pending, envelope);
+      // Answer before decoding the payload: a packet type we cannot read must
+      // still be answered, or an unsupported report costs battery.
+      if (!pending) {
+        sendAck(envelope, { powerOff: true });
+      } else if (ackBeforeCommand) {
+        sendAck(envelope, { powerOff: false });
+        scheduleCommand(pending, envelope);
+      } else {
+        // No stay-awake ack -- that is the frame the meter refuses. The command
+        // goes on its own and the exchange is closed off once it replies.
+        openReport = envelope;
+        sendCommand(pending, envelope);
+      }
 
       const reading = { ...envelope, payload: decodePayload(envelope, frame) };
       const { duplicate } = store.saveCat1Reading(reading, hex);
@@ -103,6 +149,14 @@ export function createMeterConnectionHandler(store, log = console, { commands = 
           detail: `${ack.toString('hex').toUpperCase()}  (${powerOff ? 'power off' : 'stay awake, command follows'})`,
         }),
       );
+    };
+
+    /** Let the acknowledgement land on its own before the command follows. */
+    const scheduleCommand = (cmd, envelope) => {
+      if (commandDelayMs <= 0) return sendCommand(cmd, envelope);
+      const timer = setTimeout(() => sendCommand(cmd, envelope), commandDelayMs);
+      timer.unref?.();
+      socket.once('close', () => clearTimeout(timer));
     };
 
     const sendCommand = (cmd, envelope) => {
@@ -130,6 +184,19 @@ export function createMeterConnectionHandler(store, log = console, { commands = 
       );
     };
 
+    /**
+     * Once the meter has answered, either send the next queued command while it
+     * is still awake, or tell it to sleep. Without this it sits with the radio
+     * on until the idle timeout fires.
+     */
+    const finishExchange = () => {
+      if (!openReport) return;
+      const next = commands?.nextFor(openReport.address) ?? null;
+      if (next) return sendCommand(next, openReport);
+      sendAck(openReport, { powerOff: true });
+      openReport = null;
+    };
+
     const handleWriteResponse = (frame, hex) => {
       const response = decodeWriteResponse(frame);
       const cmd = commands?.findSentByInstruction(response.address, response.instructionNumber);
@@ -152,6 +219,7 @@ export function createMeterConnectionHandler(store, log = console, { commands = 
         }),
       );
       log.info?.(formatTcpEvent('command reply raw', { peer, detail: hex }));
+      finishExchange();
     };
 
     /**
@@ -163,6 +231,7 @@ export function createMeterConnectionHandler(store, log = console, { commands = 
       const cmd = commands?.findSentByInstruction(response.address, response.instructionNumber);
       if (cmd) commands.complete(cmd, { success: true, detail: 'parameters returned' });
       log.info?.(formatReadResponse(response, hex, { peer }));
+      finishExchange();
     };
 
     const decodeCjt188 = (frame, hex) => {

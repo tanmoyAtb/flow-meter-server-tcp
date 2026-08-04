@@ -113,14 +113,26 @@ export function commandRouter(queue, log = console, { token = null } = {}) {
     const open = state === 'open';
     const forced = req.body?.forced === true;
     const meterTypeCode = req.body?.meterTypeCode ?? 0x10;
-    const params = { state, forced, sentTime: null, meterTypeCode };
+
+    // Overridable only because the meter rejects the documented 0CH with error
+    // 0BH ("wrong command"). Bounded so a typo cannot emit a malformed frame.
+    const dataLength = req.body?.dataLength ?? 0x0c;
+    if (!Number.isInteger(dataLength) || dataLength < 0x0c || dataLength > 0xff) {
+      return res.status(400).json({
+        ok: false,
+        reason: 'bad_data_length',
+        detail: 'dataLength must be an integer between 12 and 255',
+      });
+    }
+
+    const params = { state, forced, dataLength, sentTime: null, meterTypeCode };
 
     const cmd = queue.enqueue(address, {
       type: 'valve',
       params,
       build: (instructionNumber) => {
         params.sentTime = new Date().toISOString();
-        return encodeValveOperation({ meterTypeCode, address }, { open, forced }, instructionNumber);
+        return encodeValveOperation({ meterTypeCode, address }, { open, forced, dataLength }, instructionNumber);
       },
     });
 

@@ -94,9 +94,17 @@ export function decodeTableTypeCode(code) {
 // code would start pulling CJ/T 188 frames into the wrong decoder.
 const METER_CONTROLS = new Set([0x97, 0x81, 0x84]);
 
+/**
+ * Byte 9 as seen on frames the meter sends us. Its own reports always carry
+ * 03H, but a command reply mirrors back whatever we put in byte 9 -- a reply to
+ * a command sent with 01H arrives with 01H. Accepting only 03H sent those
+ * replies to the CJ/T 188 decoder, which logged them as unrecognised.
+ */
+const INBOUND_DEVICE_TYPES = new Set([0x01, 0x03]);
+
 /** True when the frame is CAT-1 rather than CJ/T 188. */
 export function isCat1Frame(buf) {
-  return buf.length > 16 && buf[9] === CAT1_DEVICE_TYPE && METER_CONTROLS.has(buf[10]);
+  return buf.length > 16 && INBOUND_DEVICE_TYPES.has(buf[9]) && METER_CONTROLS.has(buf[10]);
 }
 
 /** 4-byte big-endian unsigned. */
@@ -305,20 +313,15 @@ function addressBytes(address) {
 const toBcd = (n) => ((Math.floor(n / 10) % 10) << 4) | (n % 10);
 
 /**
- * Byte 9 of a frame the *server* originates.
+ * Byte 9 is 03H, per section I.3 "Equipment type: Fixed at 0x03" and every
+ * command table in the document.
  *
- * CAT1_DEVICE_TYPE (03H) came from watching the meter's reports, and we reused
- * it for commands on the assumption it identified the device. It does not: 03H
- * is what the *meter* stamps on its own frames. A known-good command captured
- * from the vendor's server carries 01H here, and every command we sent with 03H
- * was refused with 0BH regardless of identifier or control code -- which is the
- * signature of a field checked before the payload is ever looked at.
- *
- * Acknowledgements are deliberately left on 03H: the meter demonstrably honours
- * them (it sleeps on AFH and stays awake on 00H), and there is no reason to
- * disturb the one server-to-meter frame that already works.
+ * A frame captured from the vendor's own server carries 01H instead, so we
+ * tried it on 2026-08-04: the meter refused it with the same 0BH and echoed the
+ * 01H straight back in its reply, where every earlier reply had carried 03H. It
+ * mirrors this byte rather than validating it, so it is not what 0BH is about.
+ * The vendor has since confirmed 03H. Left here so nobody re-runs the test.
  */
-export const CAT1_SERVER_DEVICE_TYPE = 0x01;
 
 /**
  * The header every server-originated command shares, with the data field
@@ -335,7 +338,7 @@ function commandFrame({ meterTypeCode = 0x10, address }, control, identifier, in
   cmd[0] = FRAME_START;
   cmd[1] = meterTypeCode;
   addressBytes(address).copy(cmd, 2);
-  cmd[9] = CAT1_SERVER_DEVICE_TYPE;
+  cmd[9] = CAT1_DEVICE_TYPE;
   cmd[10] = control;
   cmd.writeUInt16BE(instructionNumber & 0xffff, 11);
   cmd.writeUInt16BE(0x0000, 13); // spare
@@ -406,6 +409,16 @@ export const VALVE_FORCED = 0x5a; // "0x5A: Forced Operation; !0x5A: Non-mandato
 export const VALVE_NOT_FORCED = 0x00;
 
 /**
+ * Section 2.6 gives AA05 a 12-byte data field (16-27, CS at 28), and that is
+ * the default. It is overridable because the document is not reliable here:
+ * section 2.8 states m = 0DH for AA07 while its own byte table puts CS at 40,
+ * implying 18H -- and the vendor's working AA07 frame uses 18H. So the firmware
+ * follows the byte positions, not the stated length, and a valve frame sized to
+ * 18H is worth a try against the meter's "wrong command" (0BH) refusal.
+ */
+export const VALVE_DATA_LENGTH = 0x0c;
+
+/**
  * Valve open/close (protocol section 2.6, data identifier AA05H).
  *
  *   68 | T | A6-A0 | 01 | 04 | instruction no. | 0000 | 0CH | AA05 |
@@ -416,8 +429,12 @@ export const VALVE_NOT_FORCED = 0x00;
  * actuates the valve, so the caller decides which -- there is no default that
  * is safe in every installation.
  */
-export function encodeValveOperation({ meterTypeCode = 0x10, address }, { open, forced = false }, instructionNumber) {
-  const cmd = commandFrame({ meterTypeCode, address }, WRITE_CONTROL, 0xaa05, instructionNumber, 0x0c);
+export function encodeValveOperation(
+  { meterTypeCode = 0x10, address },
+  { open, forced = false, dataLength = VALVE_DATA_LENGTH },
+  instructionNumber,
+) {
+  const cmd = commandFrame({ meterTypeCode, address }, WRITE_CONTROL, 0xaa05, instructionNumber, dataLength);
   cmd[18] = open ? VALVE_OPEN : VALVE_CLOSED;
   cmd[19] = forced ? VALVE_FORCED : VALVE_NOT_FORCED;
   return sealCommand(cmd);

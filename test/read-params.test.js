@@ -24,7 +24,7 @@ test('read command matches the documented layout', () => {
   const cmd = encodeReadParameters(target, 0x0007);
   assert.equal(cmd.length, 28); // section 1.1: CS at 26, end frame at 27
   assert.equal(cmd[0], 0x68);
-  assert.equal(cmd[9], 0x01); // server-originated, not the document's 03H
+  assert.equal(cmd[9], 0x03); // section I.3: fixed at 03H
   assert.equal(cmd[10], READ_CONTROL); // 01H, not the 04H used by writes
   assert.equal(cmd.readUInt16BE(11), 0x0007);
   assert.equal(cmd.readUInt16BE(13), 0x0000); // spare

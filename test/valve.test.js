@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   encodeValveOperation,
   decodeCat1Frame,
+  isCat1Frame,
   WRITE_CONTROL,
   VALVE_OPEN,
   VALVE_CLOSED,
@@ -40,14 +41,16 @@ test('the vendor frame validates under our own checksum rule', () => {
   assert.equal(16 + VENDOR_ACCEPTED_FRAME[15] + 2, VENDOR_ACCEPTED_FRAME.length);
 });
 
-test('our command header matches the accepted frame up to the length byte', () => {
-  // Bytes 0-14 are identifier-independent, so with the same address and
-  // instruction number they must match exactly. Byte 15 must NOT: the data
-  // length is per-command, 0CH for AA05 (section 2.6) against 18H for the
-  // vendor's AA07 (section 2.8, data field 16-39).
+test('our command header matches the accepted frame except where it should not', () => {
   const cmd = encodeValveOperation(target, { open: true }, 0x3a37);
-  assert.deepEqual(cmd.subarray(0, 15), VENDOR_ACCEPTED_FRAME.subarray(0, 15));
-  assert.equal(cmd[9], 0x01); // the byte we had as 03H on every refused command
+  // Address, meter type, control code and instruction number must match.
+  assert.deepEqual(cmd.subarray(0, 9), VENDOR_ACCEPTED_FRAME.subarray(0, 9));
+  assert.deepEqual(cmd.subarray(10, 15), VENDOR_ACCEPTED_FRAME.subarray(10, 15));
+  // Byte 9: the vendor's server sends 01H, but the document and the vendor both
+  // say 03H, and sending 01H changed nothing (the meter just echoed it back).
+  assert.equal(cmd[9], 0x03);
+  assert.equal(VENDOR_ACCEPTED_FRAME[9], 0x01);
+  // Byte 15 is per-command: 0CH for AA05 (2.6) against 18H for AA07 (2.8).
   assert.equal(cmd[15], 0x0c);
   assert.equal(VENDOR_ACCEPTED_FRAME[15], 0x18);
 });
@@ -64,11 +67,24 @@ test('the vendor AA07 payload decodes as section 2.8 says it should', () => {
   assert.equal(f[29], 0x00); // manufacturer modification NOT enabled (0xC3 would)
 });
 
+test('a reply that mirrors byte 9 back is still recognised as CAT-1', () => {
+  // Observed 2026-08-04: we sent a command with byte 9 = 01H and the meter
+  // echoed 01H in its 84H reply. Requiring 03H sent it to the CJ/T 188 decoder,
+  // which logged a real command refusal as an unrecognised frame.
+  const mirrored = Buffer.from(
+    '68100400220826100001840001000011AA050B26080414574200000000000000000C16',
+    'hex',
+  );
+  assert.equal(mirrored[9], 0x01);
+  assert.equal(isCat1Frame(mirrored), true);
+  assert.equal(decodeCat1Frame(mirrored).instructionNumber, 1);
+});
+
 test('valve command matches the documented layout', () => {
   const cmd = encodeValveOperation(target, { open: false }, 0x0042);
   assert.equal(cmd.length, 30); // section 2.6: CS at 28, end frame at 29
   assert.equal(cmd[0], 0x68);
-  assert.equal(cmd[9], 0x01); // server-originated, not the document's 03H
+  assert.equal(cmd[9], 0x03); // section I.3: fixed at 03H
   assert.equal(cmd[10], WRITE_CONTROL); // 04H
   assert.equal(cmd.readUInt16BE(11), 0x0042);
   assert.equal(cmd.readUInt16BE(13), 0x0000); // spare
@@ -77,6 +93,26 @@ test('valve command matches the documented layout', () => {
   assert.equal(cmd.at(-1), 0x16);
   assert.equal(cmd.at(-2), checksum(cmd));
   assert.equal(16 + cmd[15] + 2, cmd.length);
+});
+
+test('the data length is overridable, and the frame stays self-consistent', () => {
+  // The meter rejects the documented 0CH with 0BH; 18H matches the data field
+  // width of the one command it is known to accept (section 2.8, AA07).
+  const cmd = encodeValveOperation(target, { open: false, forced: true, dataLength: 0x18 }, 1);
+  assert.equal(cmd[15], 0x18);
+  assert.equal(cmd.length, 42);
+  assert.equal(16 + cmd[15] + 2, cmd.length);
+  assert.equal(cmd.length, VENDOR_ACCEPTED_FRAME.length); // same shape, AA05 payload
+  // Payload offsets are fixed by section 2.6 and must not move with the length.
+  assert.equal(cmd.readUInt16BE(16), 0xaa05);
+  assert.equal(cmd[18], VALVE_CLOSED);
+  assert.equal(cmd[19], VALVE_FORCED);
+  assert.equal(cmd.at(-2), checksum(cmd));
+  assert.equal(cmd.at(-1), 0x16);
+});
+
+test('the default stays at the documented 0CH', () => {
+  assert.equal(encodeValveOperation(target, { open: false }, 1)[15], 0x0c);
 });
 
 test('open sends 55H and close sends 99H', () => {
