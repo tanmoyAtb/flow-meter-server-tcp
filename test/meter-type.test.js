@@ -18,7 +18,7 @@ import {
   IN_PLACE_MODE_BYTES,
   METER_TYPE_DATA_LENGTH,
 } from '../src/lib/cat1.js';
-import { checksum } from '../src/lib/cjt188.js';
+import { checksum } from '../src/lib/frame.js';
 import { createApp } from '../src/app.js';
 import { openStore } from '../src/store/memory.js';
 import { createCommandQueue } from '../src/commands.js';

@@ -4,7 +4,7 @@ import { createApp } from './app.js';
 import { openStore } from './store/memory.js';
 import { createCommandQueue } from './commands.js';
 import { createMeterConnectionHandler } from './tcp.js';
-import { createReconciler, reconcileOptionsFromEnv } from './reconcile.js';
+import { createConfigurer, configureOptionsFromEnv } from './configure.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST ?? '0.0.0.0';
@@ -14,27 +14,27 @@ const HOST = process.env.HOST ?? '0.0.0.0';
 const API_TOKEN = process.env.API_TOKEN ?? null;
 
 // Bring every meter that reports in to the configured clock and resolution,
-// one command per contact. RECONCILE=0 turns it off and leaves the server a
+// one command per contact. CONFIGURE=0 turns it off and leaves the server a
 // pure collector that only sends what the API queued.
-const { enabled: reconcileEnabled, ...reconcileOptions } = reconcileOptionsFromEnv();
-const reconciler = reconcileEnabled ? createReconciler(reconcileOptions) : null;
+const { enabled: configureEnabled, ...configureOptions } = configureOptionsFromEnv();
+const configurer = configureEnabled ? createConfigurer(configureOptions) : null;
 
 // Mock store: everything lives in memory and is lost on restart.
 const store = openStore();
 const commands = createCommandQueue();
-const app = createApp(store, console, { commands, apiToken: API_TOKEN, reconciler });
+const app = createApp(store, console, { commands, apiToken: API_TOKEN, configurer });
 const httpServer = http.createServer(app);
-const handleMeterConnection = createMeterConnectionHandler(store, console, { commands, reconciler });
+const handleMeterConnection = createMeterConnectionHandler(store, console, { commands, configurer });
 
 // Meters cannot be pointed at a second port -- they are provisioned with one
-// address and push raw CJ/T 188 down it. Rather than split the protocols across
+// address and push raw frames down it. Rather than split raw TCP and HTTP across
 // two ports (and need another firewall rule), the first byte decides.
 //
 // The test is "does this look like HTTP", not "does this look like a frame".
 // Testing for 68H would misroute this device: it sends a 6-byte preamble
 // starting A3H before its first frame, so the connection's opening byte is not
 // 68H at all. Every HTTP method token starts with an uppercase ASCII letter,
-// which no CJ/T 188 frame (68H) or preamble byte seen so far does.
+// which no meter frame (68H) or preamble byte seen so far does.
 const isHttpStart = (byte) => byte >= 0x41 && byte <= 0x5a;
 
 // A peer that connects and then says nothing would hold a socket open forever.
@@ -66,20 +66,18 @@ const server = net.createServer((socket) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`ingest server listening on ${HOST}:${PORT}  (raw TCP + HTTP share this port)`);
-  console.log('  raw TCP   meters pushing frames straight down the socket: CAT-1 and CJ/T 188');
-  console.log('  POST /api/v1/datalogs/:deviceId   binary datalogger frames');
-  console.log('  POST /api/v1/coap_push            CJ/T 188 frames relayed by an IoT platform');
+  console.log('  raw TCP   CAT-1 meters pushing frames straight down the socket');
   console.log('  POST /api/v1/meters/:address/time queue a clock calibration');
   console.log('  GET  /api/v1/commands             queued / sent / acknowledged commands');
   console.log('  GET  /debug/store                 everything ingested so far');
   console.log(`command API auth: ${API_TOKEN ? 'x-api-token required' : 'OPEN (set API_TOKEN to require a token)'}`);
   console.log(
-    reconciler
-      ? `auto-reconcile: ON -- clock to ${reconciler.config.timeZone}, resolution to ` +
-          `${reconciler.config.resolutionLitres} L, one command per contact, ` +
-          `${reconciler.config.maxAttempts} attempts each` +
-          `${reconciler.config.allowClosedValve ? '  (WILL write AA07 to closed valves, which opens them)' : ''}`
-      : 'auto-reconcile: OFF (RECONCILE=0)',
+    configurer
+      ? `auto-configure: ON -- clock to ${configurer.config.timeZone}, resolution to ` +
+          `${configurer.config.resolutionLitres} L, one command per contact, ` +
+          `${configurer.config.maxAttempts} attempts each` +
+          `${configurer.config.allowClosedValve ? '  (WILL write AA07 to closed valves, which opens them)' : ''}`
+      : 'auto-configure: OFF (CONFIGURE=0)',
   );
   console.log('storage is in-memory only -- nothing is persisted');
 });

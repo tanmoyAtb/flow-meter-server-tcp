@@ -9,7 +9,7 @@ import {
   POWER_STAY_AWAKE,
   CAT1_DEVICE_TYPE,
 } from '../src/lib/cat1.js';
-import { checksum } from '../src/lib/cjt188.js';
+import { checksum } from '../src/lib/frame.js';
 import { CAT1_FRAME, DEVICE_METER_ADDRESS } from './fixtures.js';
 
 const envelope = decodeCat1Frame(CAT1_FRAME);

@@ -1,4 +1,4 @@
-// Raw TCP collector for meters that push CJ/T 188 frames straight down a socket.
+// Raw TCP collector for meters that push CAT-1 frames straight down a socket.
 //
 // These devices speak no application protocol at all: they open a connection and
 // write the frame. There is no HTTP request to parse, which is why an Express
@@ -8,7 +8,7 @@
 // do not recognise is still evidence about the device, and dropping it silently
 // is how an integration ends up being debugged with a packet capture.
 
-import { parseUplink, FrameError } from './lib/cjt188.js';
+import { FrameError } from './lib/frame.js';
 import {
   decodeCat1Frame,
   decodePayload,
@@ -22,7 +22,6 @@ import {
 } from './lib/cat1.js';
 import { FrameSplitter, peekEnvelope } from './lib/framing.js';
 import {
-  formatMeterReading,
   formatCat1Reading,
   formatReadResponse,
   formatTcpEvent,
@@ -67,7 +66,7 @@ export function createMeterConnectionHandler(
   log = console,
   {
     commands = null,
-    reconciler = null,
+    configurer = null,
     commandDelayMs = COMMAND_DELAY_MS,
     ackBeforeCommand = ACK_BEFORE_COMMAND,
   } = {},
@@ -98,11 +97,22 @@ export function createMeterConnectionHandler(
       const frame = event.bytes;
       const hex = frame.toString('hex').toUpperCase();
 
-      // Two protocols share the 68H…16H envelope. They disagree about byte 10,
-      // so the dispatch has to happen before either decoder sees the frame.
-      const decode = isCat1Frame(frame) ? decodeCat1 : decodeCjt188;
+      // Anything that is not CAT-1 is logged whole rather than guessed at. The
+      // 68H…16H envelope is shared by other meter protocols, so a frame can be
+      // well-formed and still not ours -- reporting it as a CAT-1 decode failure
+      // would be a lie, and the raw bytes are what identifies the device anyway.
+      if (!isCat1Frame(frame)) {
+        log.warn?.(
+          formatUnrecognisedFrame(frame, peekEnvelope(frame), 'not_cat1: envelope is valid but this is not a CAT-1 frame', {
+            peer,
+          }),
+        );
+        store.recordFailure('tcp', 'not_cat1: not a CAT-1 frame', hex);
+        return;
+      }
+
       try {
-        decode(frame, hex);
+        decodeCat1(frame, hex);
       } catch (err) {
         if (!(err instanceof FrameError)) throw err;
         log.warn?.(formatUnrecognisedFrame(frame, peekEnvelope(frame), `${err.code}: ${err.message}`, { peer }));
@@ -120,7 +130,7 @@ export function createMeterConnectionHandler(
       }
 
       // The payload is decoded before anything is written back, because the
-      // reconciler decides what to send from the clock and table type code
+      // configurer decides what to send from the clock and table type code
       // inside it. A packet we cannot read must still be answered -- otherwise
       // an unsupported report costs battery -- so a decode failure is held and
       // rethrown once the meter has been dealt with.
@@ -145,7 +155,7 @@ export function createMeterConnectionHandler(
       // `finishExchange` sends the queue's next command in the same contact once
       // a policy command succeeds. The exception is `AA00`, which never replies,
       // so a contact spent on a clock write ends there.
-      const pending = reconcile(reading) ?? commands?.nextFor(envelope.address) ?? null;
+      const pending = configure(reading) ?? commands?.nextFor(envelope.address) ?? null;
 
       if (!pending) {
         sendAck(envelope, { powerOff: true });
@@ -167,19 +177,19 @@ export function createMeterConnectionHandler(
 
     /**
      * Ask the policy whether this report justifies a command, and queue it if
-     * so. Reconciler commands go through the same queue as hand-issued ones so
+     * so. Configurer commands go through the same queue as hand-issued ones so
      * they get an instruction number, show up in `GET /api/v1/commands`, and are
      * completed by the reply handler like anything else.
      */
-    const reconcile = (reading) => {
-      if (!reconciler || !commands || !reading) return null;
-      const { command, notes } = reconciler.decide(reading);
+    const configure = (reading) => {
+      if (!configurer || !commands || !reading) return null;
+      const { command, notes } = configurer.decide(reading);
       for (const note of notes) {
-        log.warn?.(formatTcpEvent('reconcile held', { peer, detail: `${reading.address} ${note}` }));
+        log.warn?.(formatTcpEvent('configure held', { peer, detail: `${reading.address} ${note}` }));
       }
       if (!command) return null;
       log.info?.(
-        formatTcpEvent('reconcile', { peer, detail: `${reading.address} -> ${command.type}: ${command.reason}` }),
+        formatTcpEvent('configure', { peer, detail: `${reading.address} -> ${command.type}: ${command.reason}` }),
       );
       return commands.enqueue(reading.address, command);
     };
@@ -285,15 +295,6 @@ export function createMeterConnectionHandler(
       if (cmd) commands.complete(cmd, { success: true, detail: 'parameters returned' });
       log.info?.(formatReadResponse(response, hex, { peer }));
       finishExchange(true);
-    };
-
-    const decodeCjt188 = (frame, hex) => {
-      const reading = parseUplink(frame);
-      if (reading.direction !== 'uplink') {
-        throw new FrameError('not_uplink', 'control code D7 marks this as a platform-issued frame');
-      }
-      const { duplicate } = store.saveMeterReading(reading, hex);
-      log.info?.(formatMeterReading(reading, hex, { duplicate, encoding: 'binary', source: 'tcp' }));
     };
 
     socket.on('data', (chunk) => {

@@ -1,4 +1,4 @@
-// Splits a TCP byte stream into CJ/T 188 frames.
+// Splits a TCP byte stream into 68H…16H frames.
 //
 // TCP gives no message boundaries: one read can hold half a frame, two frames,
 // or a frame plus a heartbeat. This buffers until a complete frame is present.
@@ -12,7 +12,7 @@
 // boundary. The length path is still tried first because it is unambiguous when
 // it does agree.
 
-import { checksum } from './cjt188.js';
+import { checksum } from './frame.js';
 import { bcdReverse, isBcd } from './bcd.js';
 
 const FRAME_START = 0x68;
@@ -82,7 +82,7 @@ function frameLength(buf) {
  *
  * Events are `{ type: 'frame' | 'unframed', bytes }`. Bytes that are not part of
  * a frame are surfaced rather than dropped -- the 6-byte packet this device
- * sends before its data frame is not CJ/T 188 at all, and silently discarding it
+ * sends before its data frame is not a frame at all, and silently discarding it
  * is how you end up running tcpdump to find out what a device is doing.
  */
 export class FrameSplitter {

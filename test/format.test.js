@@ -1,36 +1,31 @@
-// The routes log through these formatters, and the HTTP tests run with a silent
-// logger -- so without these tests a typo'd field path would print "undefined"
-// forever and nothing would fail.
+// The TCP handler logs through these formatters, and the flow tests run with a
+// silent logger -- so without these tests a typo'd field path would print
+// "undefined" forever and nothing would fail.
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { formatMeterReading, formatDatalog } from '../src/lib/format.js';
-import { parseUplink } from '../src/lib/cjt188.js';
-import { REFERENCE_FRAME, REFERENCE_FRAME_HEX } from './fixtures.js';
+import { formatCat1Reading, formatUnrecognisedFrame } from '../src/lib/format.js';
+import { parseCat1 } from '../src/lib/cat1.js';
+import { peekEnvelope } from '../src/lib/framing.js';
+import { CAT1_FRAME, CAT1_FRAMES_HEX, REFERENCE_FRAME, DEVICE_METER_ADDRESS } from './fixtures.js';
 
-test('meter log carries the values decoded from the frame', () => {
-  const reading = parseUplink(REFERENCE_FRAME);
-  const out = formatMeterReading(reading, REFERENCE_FRAME_HEX.toUpperCase(), {
-    duplicate: false,
-    encoding: 'hex',
-  });
+const HEX = CAT1_FRAMES_HEX[0].toUpperCase();
+
+test('cat1 log carries the values decoded from the frame', () => {
+  const out = formatCat1Reading(parseCat1(CAT1_FRAME), HEX, { duplicate: false });
 
   for (const expected of [
-    '21081300004575',
-    '2021-08-26T04:14:46',
-    'cumulative 206.66 m3',
-    'settlement 18.03 m3',
-    'temp 27.92 C',
+    DEVICE_METER_ADDRESS,
+    'CAT-1 · cold water meter',
+    'packet postpaid_standard',
+    '2023-09-23T06:02:46',
+    'report #16',
     'valve open',
-    'alarms: emptyPipe',
-    '-76 dBm',
-    'transmission #11',
-    'IMEI 864823047988050',
-    'ICCID 89861119253017474430',
-    'uploads at 04:00',
-    'cutoff 00:00 at 206.66 m3',
-    '26/47 half-hour slots non-zero',
-    '13:30 3.95',
+    'IMEI 867512079825846',
+    'ICCID 89860422152570009782',
+    // Captured before the resolution was written down to 1 L, so these frames
+    // still report the factory 1000 L step.
+    'counts in 1000 L steps',
   ]) {
     assert.ok(out.includes(expected), `missing ${JSON.stringify(expected)} in:\n${out}`);
   }
@@ -39,34 +34,33 @@ test('meter log carries the values decoded from the frame', () => {
   assert.ok(!out.includes('[object Object]'), 'no unformatted objects');
 });
 
-test('duplicate meter readings are marked in the log', () => {
-  const reading = parseUplink(REFERENCE_FRAME);
-  const out = formatMeterReading(reading, REFERENCE_FRAME_HEX, { duplicate: true, encoding: 'binary' });
+test('duplicate readings are marked in the log', () => {
+  const out = formatCat1Reading(parseCat1(CAT1_FRAME), HEX, { duplicate: true });
   assert.ok(out.includes('(duplicate)'));
-  assert.ok(out.includes('binary'));
-});
-
-test('datalog log lists every record', () => {
-  const records = [
-    { timestamp: 1738000000, battery: 3.7, temperature: 21.5, waterLevel: 1.234, barometric: 1013.2 },
-    { timestamp: 1738000600, battery: 3.69, temperature: 21.4, waterLevel: null, barometric: 1013.1 },
-  ];
-  const out = formatDatalog('HS-GWL-0042', records, { inserted: 2, duplicates: 0 });
-
-  assert.ok(out.includes('HS-GWL-0042'));
-  assert.ok(out.includes('2 record(s) · 2 new · 0 duplicate'));
-  assert.ok(out.includes('2025-01-27T17:46:40Z'), 'unix seconds rendered as UTC');
-  assert.ok(out.includes('batt 3.70 V'));
-  assert.ok(out.includes('level 1.234 m'));
-  assert.ok(out.includes('(invalid)'), 'null water level is shown as invalid, not blank');
-  assert.ok(!out.includes('undefined'));
-  assert.equal(out.split('\n').length, 4, 'header + counts + one line per record');
 });
 
 test('unknown units log as a dash rather than null', () => {
-  const reading = parseUplink(REFERENCE_FRAME);
-  reading.payload.cumulativeFlow.value = null;
-  const out = formatMeterReading(reading, REFERENCE_FRAME_HEX, { duplicate: false, encoding: 'hex' });
-  assert.ok(out.includes('cumulative —'));
+  const reading = parseCat1(CAT1_FRAME);
+  reading.payload.signalStrengthDbm = null;
+  const out = formatCat1Reading(reading, HEX, { duplicate: false });
+  assert.ok(out.includes('radio   — RSSI'), `expected a dash for RSSI in:\n${out}`);
   assert.ok(!out.includes('null'));
+});
+
+// The old wording claimed an unrecognised frame was "valid CJ/T 188", which was
+// printed against the fleet's own CAT-1 frames before CAT-1 was supported.
+test('an unrecognised frame is not blamed on a particular protocol', () => {
+  const out = formatUnrecognisedFrame(
+    REFERENCE_FRAME,
+    peekEnvelope(REFERENCE_FRAME),
+    'not_cat1: not a CAT-1 frame',
+    { peer: '10.0.0.1:1234' },
+  );
+
+  assert.ok(out.includes('UNRECOGNISED'));
+  assert.ok(out.includes('not_cat1'));
+  // The raw hex is dumped in full, so only the prose is checked.
+  const prose = out.split('\n').filter((l) => !l.trim().startsWith('raw')).join('\n');
+  assert.ok(!prose.includes('CJ/T 188'), 'must not name a protocol it did not verify');
+  assert.ok(!prose.includes('9097'));
 });

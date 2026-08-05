@@ -36,7 +36,7 @@ export const COMMAND_TYPES = [
 ] as const;
 export type CommandType = (typeof COMMAND_TYPES)[number];
 
-export const COMMAND_SOURCES = ['api', 'reconciler'] as const;
+export const COMMAND_SOURCES = ['api', 'configurer'] as const;
 export type CommandSource = (typeof COMMAND_SOURCES)[number];
 
 export interface CommandDoc {

@@ -750,12 +750,12 @@ never acks will swallow the meter just as completely as one that is switched off
 The safe shape, and the one that was actually used:
 
 1. Stand the new server up and prove the ack (checklist above).
-2. Turn **off** any auto-reconcile policy on the new server. A fresh server has no
+2. Turn **off** any auto-configure policy on the new server. A fresh server has no
    history for a meter that arrives, so its policy fires on the very first contact —
    and on this firmware that could mean `AA07`, which opens the valve (§9). Let the
    meter arrive, be acknowledged, and nothing else.
 3. Queue the `AA17` on the **old** server. That is where the meter still reports.
-   If that server runs an auto-reconcile policy that outranks hand-issued
+   If that server runs an auto-configure policy that outranks hand-issued
    commands, check it has no outstanding work for this meter first — otherwise
    the `AA17` waits behind it, and a clock write in particular consumes the whole
    contact because `AA00` never replies (§10).
@@ -777,7 +777,7 @@ door unless you have watched their ack with your own packet capture.
 - [ ] `setNoDelay(true)` and an idle timeout
 - [ ] Frame splitter using `16 + m + 2`; handle several frames per read, and frames split across reads
 - [ ] Verify the checksum; reject and log mismatches
-- [ ] Dispatch CAT-1 vs CJ/T 188 on bytes 9 and 10 before decoding
+- [x] Dispatch on bytes 9 and 10 before decoding; anything not CAT-1 is logged raw, not guessed at
 - [ ] Accept byte 9 of `01H` **or** `03H` on inbound frames
 - [ ] Identify meters by the 14-digit address, never by source IP
 - [ ] Log every frame raw, including ones you cannot decode

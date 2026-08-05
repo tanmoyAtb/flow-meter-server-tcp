@@ -20,9 +20,8 @@ import {
   databaseUrl,
   databaseState,
   Meter,
-  Cat1Reading,
   MeterReading,
-  Datalog,
+  usageBetween,
   Command,
   IngestFailure,
   nextSequence,
@@ -48,7 +47,7 @@ before(async () => {
     await mongoose.connection.dropDatabase();
     // Unique indexes are built asynchronously; the dedup tests below are
     // meaningless until they exist.
-    await Promise.all([Meter.init(), Cat1Reading.init(), MeterReading.init(), Datalog.init(), Command.init()]);
+    await Promise.all([Meter.init(), MeterReading.init(), Command.init()]);
     available = true;
   } catch {
     available = false;
@@ -76,24 +75,40 @@ test('the URL comes from the environment, with a local default', () => {
 
 // --- the fleet document -------------------------------------------------
 
-test('a meter is keyed by its address, not an ObjectId', async (t) => {
+test('a meter is keyed by its 14-digit ID, not an ObjectId', async (t) => {
   if (!needsMongo(t)) return;
 
   const now = new Date();
-  await Meter.create({
-    _id: ADDRESS,
-    protocol: 'cat1',
-    firstSeenAt: now,
-    lastSeenAt: now,
-    label: null,
-    site: null,
-    notes: null,
-  });
+  await Meter.create({ _id: ADDRESS, firstSeenAt: now, lastSeenAt: now });
 
   const found = await Meter.findById(ADDRESS).lean();
   assert.equal(found?._id, ADDRESS);
-  assert.equal(found?.protocol, 'cat1');
-  assert.equal(found?.reportCount, 0);
+  assert.equal(found?.isConfigured, false, 'a meter is presumed off-policy until checked');
+});
+
+test('a meter can be registered by hand before it ever reports', async (t) => {
+  if (!needsMongo(t)) return;
+
+  // The reason the meter ID is the primary key. Someone types in the ID, label,
+  // location and SIM number at commissioning; the first report upserts onto
+  // that document instead of creating a second one to be merged later.
+  const ID = '00102608229999';
+  await Meter.create({
+    _id: ID,
+    label: 'Banani site B',
+    location: 'Dhaka North',
+    simPhoneNumber: '+8801700000000',
+    firstSeenAt: new Date(),
+    lastSeenAt: new Date(),
+  });
+
+  await Meter.findByIdAndUpdate(ID, { $set: { lastSeenAt: new Date(), imei: '864823047988050' } });
+
+  const found = await Meter.findById(ID).lean();
+  assert.equal(found?.label, 'Banani site B', 'the hand-entered registration survived first contact');
+  assert.equal(found?.simPhoneNumber, '+8801700000000');
+  assert.equal(found?.imei, '864823047988050', 'and the report filled in what only the meter knows');
+  assert.equal(await Meter.countDocuments({ _id: ID }), 1, 'one document, not two');
 });
 
 test('a report does not clobber the fields an operator owns', async (t) => {
@@ -101,39 +116,49 @@ test('a report does not clobber the fields an operator owns', async (t) => {
 
   await Meter.findByIdAndUpdate(
     ADDRESS,
-    { $set: { label: 'Gulshan pump house', site: 'Dhaka North', notes: 'valve sticks' } },
+    {
+      $set: {
+        label: 'Gulshan pump house',
+        location: 'Dhaka North',
+        notes: 'valve sticks',
+        simPhoneNumber: '+8801711111111',
+      },
+    },
     { upsert: true },
   );
 
   // A report writes only report-owned fields. This is the shape the ingest path
-  // must use -- $set of a whole document would wipe the three fields above, and
+  // must use -- $set of a whole document would wipe the four fields above, and
   // nothing would ever report the loss.
-  const reportPatch = { lastSeenAt: new Date(), valve: 'closed', resolutionLitres: 1, protocol: 'cat1' as const };
+  const reportPatch = { lastSeenAt: new Date(), valve: 'closed', resolutionLiters: 1, meterReportNumber: 73 };
   for (const field of Object.keys(reportPatch)) {
     assert.ok(
       (REPORT_OWNED_FIELDS as readonly string[]).includes(field),
       `${field} must be listed in REPORT_OWNED_FIELDS`,
     );
   }
-  await Meter.findByIdAndUpdate(ADDRESS, { $set: reportPatch, $inc: { reportCount: 1 } });
+  await Meter.findByIdAndUpdate(ADDRESS, { $set: reportPatch });
 
   const after = await Meter.findById(ADDRESS).lean();
   assert.equal(after?.label, 'Gulshan pump house', 'operator label survived the report');
-  assert.equal(after?.site, 'Dhaka North');
+  assert.equal(after?.location, 'Dhaka North');
   assert.equal(after?.notes, 'valve sticks');
+  assert.equal(after?.simPhoneNumber, '+8801711111111', 'the SIM number is never on the wire, so nothing may overwrite it');
   assert.equal(after?.valve, 'closed');
-  assert.equal(after?.resolutionLitres, 1);
+  assert.equal(after?.resolutionLiters, 1);
 
-  assert.ok(
-    !(REPORT_OWNED_FIELDS as readonly string[]).includes('label'),
-    'label must never be report-owned, or the guarantee above is empty',
-  );
+  for (const field of ['label', 'location', 'notes', 'simPhoneNumber']) {
+    assert.ok(
+      !(REPORT_OWNED_FIELDS as readonly string[]).includes(field),
+      `${field} must never be report-owned, or the guarantee above is empty`,
+    );
+  }
 });
 
 test('the meter clock is stored as written digits, not an instant', async (t) => {
   if (!needsMongo(t)) return;
 
-  await Meter.findByIdAndUpdate(ADDRESS, { $set: { meterClock: '2026-08-05T15:35:00', clockSkewSeconds: 2 } });
+  await Meter.findByIdAndUpdate(ADDRESS, { $set: { meterClock: '2026-08-05T15:35:00' } });
   const found = await Meter.findById(ADDRESS).lean();
 
   // The distinction that matters: these meters shipped on UTC+8 and were moved
@@ -141,76 +166,91 @@ test('the meter clock is stored as written digits, not an instant', async (t) =>
   // change. A Date here would assert an instant the meter never had.
   assert.equal(typeof found?.meterClock, 'string');
   assert.equal(found?.meterClock, '2026-08-05T15:35:00');
-  assert.equal(found?.clockSkewSeconds, 2);
+});
+
+test('an unknown valve state is refused by the schema', async (t) => {
+  if (!needsMongo(t)) return;
+
+  await assert.rejects(
+    () => Meter.findByIdAndUpdate(ADDRESS, { $set: { valve: 'half' } }, { runValidators: true }),
+    /not a valid enum value/,
+  );
 });
 
 // --- deduplication, now the index's job ---------------------------------
 
-const cat1Reading = (overrides: Record<string, unknown> = {}) => ({
-  meterAddress: ADDRESS,
+const reading = (overrides: Record<string, unknown> = {}) => ({
+  meterId: ADDRESS,
   receivedAt: new Date(),
   meterClock: '2026-08-05T15:35:00',
-  cumulativeReportCount: 68,
+  meterReportNumber: 68,
+  totalUsageLiters: 2229,
   rawFrame: '6810040022082610000397...16',
   ...overrides,
 });
 
-test('a CAT-1 retry lands as one reading, not two', async (t) => {
+test('a re-sent report lands as one reading, not two', async (t) => {
   if (!needsMongo(t)) return;
 
-  await Cat1Reading.create(cat1Reading());
+  // Observed on the live server: report #16 arrived twice, same counter and
+  // same clock, because the acknowledgement went missing on the cellular link.
+  // A second row here would corrupt every period query spanning it.
+  await MeterReading.create(reading());
   await assert.rejects(
-    () => Cat1Reading.create(cat1Reading()),
+    () => MeterReading.create(reading()),
     (err: { code?: number }) => err.code === 11000,
     'the unique index rejects the replay',
   );
 
   // The counter moving on is a genuinely new report.
-  await Cat1Reading.create(cat1Reading({ cumulativeReportCount: 69, meterClock: '2026-08-06T15:35:00' }));
-  assert.equal(await Cat1Reading.countDocuments({ meterAddress: ADDRESS }), 2);
+  await MeterReading.create(reading({ meterReportNumber: 69, meterClock: '2026-08-06T15:35:00' }));
+  assert.equal(await MeterReading.countDocuments({ meterId: ADDRESS }), 2);
 });
 
-test('a CJ/T 188 platform retry is deduped on (address, meter time)', async (t) => {
+test('usage over a period is a difference of cumulative totals', async (t) => {
   if (!needsMongo(t)) return;
+  await MeterReading.deleteMany({});
 
-  const reading = { meterAddress: '21081300004575', meterTime: '2021-08-26T04:14:46', receivedAt: new Date(), rawFrame: '68...16' };
-  await MeterReading.create(reading);
-  await assert.rejects(() => MeterReading.create(reading), (err: { code?: number }) => err.code === 11000);
+  const day = (n: number) => new Date(Date.UTC(2026, 6, n));
+  for (const [n, total] of [[1, 1000], [2, 1150], [3, 1300], [4, 1500]] as const) {
+    await MeterReading.create(
+      reading({ receivedAt: day(n), meterReportNumber: n, meterClock: `2026-07-0${n}T06:00:00`, totalUsageLiters: total }),
+    );
+  }
 
-  assert.equal(await MeterReading.countDocuments({}), 1);
+  assert.equal(await usageBetween(ADDRESS, day(1), day(4)), 500);
+  assert.equal(await usageBetween(ADDRESS, day(2), day(3)), 150);
 });
 
-test('the 47 half-hourly slots round-trip as one document', async (t) => {
+test('a missed report does not lose the water it carried', async (t) => {
   if (!needsMongo(t)) return;
+  await MeterReading.deleteMany({});
 
-  const increments = Array.from({ length: 47 }, (_, i) => ({ time: `slot${i}`, value: i * 0.5 }));
-  await MeterReading.create({
-    meterAddress: '21081300004575',
-    meterTime: '2021-08-26T08:14:46',
-    receivedAt: new Date(),
-    rawFrame: '68...16',
-    increments,
-  });
+  // The meter reported on the 1st and the 4th; the two in between never
+  // arrived, and their absence is visible as a gap in meterReportNumber. The
+  // cumulative total still carries their water, which is exactly why period
+  // usage differences the total instead of summing dailyUsageLiters.
+  const day = (n: number) => new Date(Date.UTC(2026, 6, n));
+  await MeterReading.create(reading({ receivedAt: day(1), meterReportNumber: 70, totalUsageLiters: 1000, dailyUsageLiters: 100, meterClock: '2026-07-01T06:00:00' }));
+  await MeterReading.create(reading({ receivedAt: day(4), meterReportNumber: 73, totalUsageLiters: 1500, dailyUsageLiters: 120, meterClock: '2026-07-04T06:00:00' }));
 
-  const found = await MeterReading.findOne({ meterTime: '2021-08-26T08:14:46' }).lean();
-  assert.equal(found?.increments.length, 47);
-  assert.equal(found?.increments[46]?.value, 23);
-  // Subdocuments carry no _id of their own -- they are values, not entities.
-  assert.ok(!('_id' in (found?.increments[0] ?? {})), 'increments are plain values');
+  assert.equal(await usageBetween(ADDRESS, day(1), day(4)), 500, 'all four days of water');
+
+  const rows = await MeterReading.find({ meterId: ADDRESS }).sort({ meterReportNumber: 1 }).lean();
+  const summed = rows.reduce((n, r) => n + (r.dailyUsageLiters ?? 0), 0);
+  assert.equal(summed, 220, 'summing the daily figure would have lost 280 L');
+  assert.equal(rows[1]!.meterReportNumber! - rows[0]!.meterReportNumber!, 3, 'and the gap is visible');
 });
 
-test('datalog dedup is per (device, timestamp)', async (t) => {
+test('a period with nothing to anchor on returns null, not zero', async (t) => {
   if (!needsMongo(t)) return;
+  await MeterReading.deleteMany({});
 
-  await Datalog.create({ deviceId: 'HS-GWL-0042', timestamp: 1738000000, receivedAt: new Date(), battery: 3.7 });
-  await assert.rejects(
-    () => Datalog.create({ deviceId: 'HS-GWL-0042', timestamp: 1738000000, receivedAt: new Date() }),
-    (err: { code?: number }) => err.code === 11000,
-  );
+  await MeterReading.create(reading({ receivedAt: new Date(Date.UTC(2026, 6, 10)), totalUsageLiters: 1000 }));
 
-  // Same timestamp, different device is not a duplicate.
-  await Datalog.create({ deviceId: 'HS-GWL-0043', timestamp: 1738000000, receivedAt: new Date() });
-  assert.equal(await Datalog.countDocuments({}), 2);
+  // Before the meter's first report there is no honest answer. Zero would be
+  // indistinguishable from a meter that genuinely used no water.
+  assert.equal(await usageBetween(ADDRESS, new Date(Date.UTC(2026, 5, 1)), new Date(Date.UTC(2026, 5, 30))), null);
 });
 
 // --- sequences ----------------------------------------------------------
@@ -246,7 +286,7 @@ test('a queued command survives as a row, with no closure in it', async (t) => {
     _id: id,
     address: ADDRESS,
     type: 'set_clock',
-    source: 'reconciler',
+    source: 'configurer',
     params: { method: 'aa00', timeZone: 'Asia/Dhaka', time: null, meterTypeCode: 0x10 },
     instructionNumber,
     status: 'queued',
@@ -256,7 +296,7 @@ test('a queued command survives as a row, with no closure in it', async (t) => {
 
   const found = await Command.findById(id).lean();
   assert.equal(found?.type, 'set_clock');
-  assert.equal(found?.source, 'reconciler');
+  assert.equal(found?.source, 'configurer');
   // The whole point: everything needed to build the frame later is data.
   assert.equal(found?.params.method, 'aa00');
   assert.equal(found?.params.timeZone, 'Asia/Dhaka');

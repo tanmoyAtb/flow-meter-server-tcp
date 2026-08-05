@@ -21,7 +21,7 @@ import {
   SERVER_ENDPOINT_DATA_LENGTH,
   SERVER_ENDPOINT_ENABLE,
 } from '../src/lib/cat1.js';
-import { checksum } from '../src/lib/cjt188.js';
+import { checksum } from '../src/lib/frame.js';
 import { createApp } from '../src/app.js';
 import { openStore } from '../src/store/memory.js';
 import { createCommandQueue } from '../src/commands.js';

@@ -1,213 +1,102 @@
-// The fleet: one document per physical meter, holding its latest known state.
-//
-// Until now a meter existed only as a recurring value in a column of readings.
-// That is enough to chart one device and useless for operating a hundred:
-// "which meters have not called home this week", "which are still on the wrong
-// resolution", "which are running their battery down" are questions about the
-// *current state* of a device, and answering them by scanning the whole reading
-// history is the wrong shape.
-//
-// So the readings collections stay append-only and are the history; this is the
-// present. Nothing here is authoritative -- every field is the last thing a
-// meter said about itself, and a meter that has not reported in a month still
-// shows the state it was in a month ago. `lastSeenAt` is what tells you how
-// much of the rest to believe.
+// The fleet: one document per meter, holding its latest known state.
+// `meterreadings` is the history; this is the present, and `lastSeenAt` says
+// how much of the snapshot below is still worth believing.
 
-import { Schema } from 'mongoose';
-import { defineModel } from '../define-model.js';
+import { Schema } from "mongoose";
+import { defineModel } from "../define-model.js";
 
-export const METER_PROTOCOLS = ['cat1', 'cjt188'] as const;
-export type MeterProtocol = (typeof METER_PROTOCOLS)[number];
-
-/** Per-setting counters for the auto-reconcile ladder. */
-export interface ReconcileAttempts {
-  set_clock?: number;
-  set_metering?: number;
-}
+export const VALVE_STATES = ["open", "closed", "abnormal", "reserved"] as const;
+export type ValveState = (typeof VALVE_STATES)[number];
 
 export interface MeterDoc {
-  /** The 14-digit BCD meter address, used directly as the primary key. */
+  /** The 14-digit meter ID. Every frame carries it, so ingest is one upsert. */
   _id: string;
-  protocol: MeterProtocol;
 
   // --- operator-owned: never written from a report ---
   label: string | null;
-  site: string | null;
+  location: string | null;
   notes: string | null;
+  /** The SIM's number. Operator-entered -- the meter transmits IMEI, never this. */
+  simPhoneNumber: string | null;
 
-  // --- contact ---
+  imei: string | null;
+
   firstSeenAt: Date;
   lastSeenAt: Date;
-  /** Source IP:port of the last contact. Cellular NAT moves this constantly. */
-  lastPeer: string | null;
-  lastPacket: string | null;
-  lastReportingTriggers: string[];
-  reportCount: number;
+  /** Does this meter match the configuration policy as of `lastSeenAt`. */
+  isConfigured: boolean;
 
-  // --- identity ---
-  meterType: string | null;
-  meterTypeCode: number | null;
-  imei: string | null;
-  iccid: string | null;
-  hardwareVersion: string | null;
-  softwareVersion: string | null;
+  // --- latest snapshot, overwritten by every report ---
+  totalUsageLiters: number | null;
+  dailyUsageLiters: number | null;
+  monthlyUsageLiters: number | null;
+  /** The unit the three above are counted in. Not a constant: 1000 L -> 1 L rollout. */
+  resolutionLiters: number | null;
+
+  valve: ValveState | null;
+  batteryVolts: number | null;
+  signalStrengthDbm: number | null;
 
   /**
-   * The meter's own clock, as a zoneless wall-clock string.
-   *
-   * Deliberately NOT a Date. The meter has no concept of a time zone -- it
-   * stores exactly the six BCD digits it was given and reports them back, so
-   * "2026-08-05T15:35:00" means the digits on its display and nothing more.
-   * Storing that as a Date would silently assert an instant it does not have,
-   * and this fleet has already lived through the consequences: these meters
-   * shipped on UTC+8 and were moved to Dhaka UTC+6, so the same digits mean
-   * different instants either side of that change.
-   *
-   * `clockSkewSeconds` is the derived, genuinely comparable number: how far the
-   * meter's digits are from what `clockTimeZone` says they should read.
+   * Zoneless wall clock, deliberately not a Date: the meter stores six BCD
+   * digits and has no zone. These shipped on UTC+8 and moved to Dhaka UTC+6, so
+   * the same digits mean different instants either side of that change.
    */
   meterClock: string | null;
-  clockSkewSeconds: number | null;
-  clockTimeZone: string | null;
 
-  // --- configuration the reconciler acts on ---
-  resolutionLitres: number | null;
-  paymentType: string | null;
-  valveType: string | null;
-  tableTypeCode: string | null;
-  reportingIntervalMinutes: number | null;
-  reportingDescription: string | null;
-
-  // --- state ---
-  valve: string | null;
-  batteryUndervoltage: boolean | null;
-  voltageVolts: number | null;
-  alarms: Record<string, boolean>;
-
-  cumulativeUsageLitres: number | null;
-  dailyUsageLitres: number | null;
-  monthlyUsageLitres: number | null;
-
-  signalStrengthDbm: number | null;
-  signalQualityDb: number | null;
-  snrDb: number | null;
-
-  cumulativeReportCount: number | null;
-  dailyReportCount: number | null;
-
-  /**
-   * How many times the reconciler has tried to fix each setting.
-   *
-   * Kept on the meter rather than in process memory so a restart does not hand
-   * a non-complying meter three fresh attempts. These are battery devices, and
-   * the whole point of the cap is to stop commanding one forever.
-   */
-  reconcileAttempts: ReconcileAttempts;
+  /** The meter's own transmission counter at last contact. */
+  meterReportNumber: number | null;
 }
 
 const meterSchema = new Schema<MeterDoc>(
   {
     _id: { type: String, required: true },
-    protocol: { type: String, enum: METER_PROTOCOLS, required: true },
 
     label: { type: String, default: null },
-    site: { type: String, default: null },
+    location: { type: String, default: null },
     notes: { type: String, default: null },
+    simPhoneNumber: { type: String, default: null },
+
+    imei: { type: String, default: null },
 
     firstSeenAt: { type: Date, required: true },
     lastSeenAt: { type: Date, required: true },
-    lastPeer: { type: String, default: null },
-    lastPacket: { type: String, default: null },
-    lastReportingTriggers: { type: [String], default: [] },
-    reportCount: { type: Number, default: 0 },
+    isConfigured: { type: Boolean, default: false },
 
-    meterType: { type: String, default: null },
-    meterTypeCode: { type: Number, default: null },
-    imei: { type: String, default: null },
-    iccid: { type: String, default: null },
-    hardwareVersion: { type: String, default: null },
-    softwareVersion: { type: String, default: null },
+    totalUsageLiters: { type: Number, default: null },
+    dailyUsageLiters: { type: Number, default: null },
+    monthlyUsageLiters: { type: Number, default: null },
+    resolutionLiters: { type: Number, default: null },
+
+    valve: { type: String, enum: [...VALVE_STATES, null], default: null },
+    batteryVolts: { type: Number, default: null },
+    signalStrengthDbm: { type: Number, default: null },
 
     meterClock: { type: String, default: null },
-    clockSkewSeconds: { type: Number, default: null },
-    clockTimeZone: { type: String, default: null },
-
-    resolutionLitres: { type: Number, default: null },
-    paymentType: { type: String, default: null },
-    valveType: { type: String, default: null },
-    tableTypeCode: { type: String, default: null },
-    reportingIntervalMinutes: { type: Number, default: null },
-    reportingDescription: { type: String, default: null },
-
-    valve: { type: String, default: null },
-    batteryUndervoltage: { type: Boolean, default: null },
-    voltageVolts: { type: Number, default: null },
-    alarms: { type: Schema.Types.Mixed, default: () => ({}) },
-
-    cumulativeUsageLitres: { type: Number, default: null },
-    dailyUsageLitres: { type: Number, default: null },
-    monthlyUsageLitres: { type: Number, default: null },
-
-    signalStrengthDbm: { type: Number, default: null },
-    signalQualityDb: { type: Number, default: null },
-    snrDb: { type: Number, default: null },
-
-    cumulativeReportCount: { type: Number, default: null },
-    dailyReportCount: { type: Number, default: null },
-
-    reconcileAttempts: { type: Schema.Types.Mixed, default: () => ({}) },
+    meterReportNumber: { type: Number, default: null },
   },
   { versionKey: false, timestamps: true, _id: false },
 );
 
-// "Who has gone quiet" is the most-asked question about a fleet, and it sorts
-// on this. The rest support the reconciler's own view: which meters are still
-// off-policy, and which it has given up on.
 meterSchema.index({ lastSeenAt: -1 });
-meterSchema.index({ resolutionLitres: 1, lastSeenAt: -1 });
-meterSchema.index({ valve: 1 });
+meterSchema.index({ isConfigured: 1, lastSeenAt: -1 });
 
-export const Meter = defineModel<MeterDoc>('Meter', meterSchema, 'meters');
+export const Meter = defineModel<MeterDoc>("Meter", meterSchema, "meters");
 
 /**
- * The fields a report is allowed to overwrite.
- *
- * `label`, `site` and `notes` belong to whoever is operating the fleet, and a
- * report must never clobber them -- which is easy to do by accident when the
- * upsert is written as "$set the whole document". Listing the report-owned
- * fields explicitly is what keeps that from happening.
+ * The only fields a report may write. Everything omitted here belongs to the
+ * operator, and a `$set` of the whole document would wipe it silently.
  */
 export const REPORT_OWNED_FIELDS = [
-  'protocol',
-  'lastSeenAt',
-  'lastPeer',
-  'lastPacket',
-  'lastReportingTriggers',
-  'meterType',
-  'meterTypeCode',
-  'imei',
-  'iccid',
-  'hardwareVersion',
-  'softwareVersion',
-  'meterClock',
-  'clockSkewSeconds',
-  'clockTimeZone',
-  'resolutionLitres',
-  'paymentType',
-  'valveType',
-  'tableTypeCode',
-  'reportingIntervalMinutes',
-  'reportingDescription',
-  'valve',
-  'batteryUndervoltage',
-  'voltageVolts',
-  'alarms',
-  'cumulativeUsageLitres',
-  'dailyUsageLitres',
-  'monthlyUsageLitres',
-  'signalStrengthDbm',
-  'signalQualityDb',
-  'snrDb',
-  'cumulativeReportCount',
-  'dailyReportCount',
+  "imei",
+  "lastSeenAt",
+  "totalUsageLiters",
+  "dailyUsageLiters",
+  "monthlyUsageLiters",
+  "resolutionLiters",
+  "valve",
+  "batteryVolts",
+  "signalStrengthDbm",
+  "meterClock",
+  "meterReportNumber",
 ] as const satisfies readonly (keyof MeterDoc)[];

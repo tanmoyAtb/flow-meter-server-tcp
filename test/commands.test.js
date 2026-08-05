@@ -9,7 +9,7 @@ import {
   decodeWriteResponse,
   WRITE_CONTROL,
 } from '../src/lib/cat1.js';
-import { checksum, FrameError } from '../src/lib/cjt188.js';
+import { checksum, FrameError } from '../src/lib/frame.js';
 import { DEVICE_METER_ADDRESS } from './fixtures.js';
 
 const target = { meterTypeCode: 0x10, address: DEVICE_METER_ADDRESS };

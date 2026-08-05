@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { parseCat1, decodeCat1Frame, isCat1Frame, decodeTableTypeCode } from '../src/lib/cat1.js';
-import { FrameError } from '../src/lib/cjt188.js';
+import { FrameError } from '../src/lib/frame.js';
 import { CAT1_FRAME, CAT1_FRAMES, DEVICE_METER_ADDRESS, REFERENCE_FRAME } from './fixtures.js';
 
 test('recognises CAT-1 by device type 03H + control code 97H', () => {

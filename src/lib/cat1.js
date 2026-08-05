@@ -1,15 +1,16 @@
 // CAT-1 Remote Water Meter Communication Protocol (Shenzhen Jia Ronghua, V1.0).
 //
-// A different protocol from the CJ/T 188 decoder in cjt188.js, despite sharing
-// the 68H…16H envelope and the same checksum rule. The two disagree on what
-// byte 10 means, which matters:
+// The only protocol this server decodes. It shares the 68H…16H envelope and the
+// checksum rule with CJ/T 188, which is why isCat1Frame() below exists: the two
+// disagree on what byte 10 means, and getting it wrong is not a graceful
+// failure.
 //
 //   CJ/T 188 : byte 10 is the data LENGTH, and the frame is L + 13 bytes
 //   CAT-1    : byte 10 is a fixed CONTROL CODE 97H, and the length lives at 15
 //
 // Reading a CAT-1 frame with the CJ/T 188 layout yields "L=151, so this frame
-// should be 164 bytes" for an 88-byte frame -- which is exactly how these
-// frames were being rejected before this decoder existed.
+// should be 164 bytes" for an 88-byte frame -- which is exactly how this fleet's
+// own reports were being logged as unrecognised before this decoder existed.
 //
 // Frame layout (protocol section I, and section 3.3 for packet type 03):
 //   0     68H start
@@ -25,7 +26,7 @@
 //   15+m+1 CS      checksum, and 15+m+2 is 16H
 
 import { bcdForward, bcdReverse, bcdByte, isBcd } from './bcd.js';
-import { FrameError, checksum } from './cjt188.js';
+import { FrameError, checksum } from './frame.js';
 
 const FRAME_START = 0x68;
 const FRAME_END = 0x16;

@@ -1,5 +1,14 @@
-// The worked example from section 3.1.1 of the protocol PDF, and the values
-// its own parsing table says it should decode to.
+// A valid 68H…16H frame that is NOT CAT-1: the worked example from section
+// 3.1.1 of the CJ/T 188 protocol PDF. The decoder for it is gone -- the fleet
+// speaks CAT-1 only -- but the frame is kept because it is the one thing that
+// proves the two layers below the decoder are protocol-agnostic:
+//
+//   - the splitter locates it correctly even though its length byte is honest
+//     and CAT-1's lies (framing.test.js)
+//   - isCat1Frame() rejects it, which is the negative case for the sniffer
+//     that decides whether a frame is ours at all (cat1.test.js)
+//
+// Replacing it with a hand-made buffer would weaken both: this one is real.
 
 export const REFERENCE_FRAME_HEX = [
   '68107545000013082181AC9097002B606620002B308001002B00000000',
@@ -12,36 +21,6 @@ export const REFERENCE_FRAME_HEX = [
 ].join('');
 
 export const REFERENCE_FRAME = Buffer.from(REFERENCE_FRAME_HEX, 'hex');
-
-// Every non-zero half-hourly slot in the reference frame, per the PDF table.
-export const REFERENCE_INCREMENTS = {
-  '13:30': 3.95,
-  '13:00': 1.94,
-  '12:30': 7.44,
-  '12:00': 4.45,
-  '11:30': 7.071,
-  '11:00': 2.539,
-  '10:30': 1.55,
-  '10:00': 1.95,
-  '09:30': 3.381,
-  '09:00': 1.159,
-  '08:30': 23.021,
-  '07:30': 3.439,
-  '07:00': 1.91,
-  '06:30': 2.941,
-  '06:00': 2.56,
-  '05:30': 6.139,
-  '05:00': 3.941,
-  '04:30': 5.57,
-  '04:00': 3.339,
-  '03:30': 5.701,
-  '03:00': 3.339,
-  '02:30': 1.67,
-  '02:00': 5.33,
-  '01:30': 1.941,
-  '01:00': 0.179,
-  '00:30': 11.48,
-};
 
 // Six frames captured from a real meter pushing raw TCP to port 8505 on
 // 2026-08-03. CAT-1 protocol, packet type 03 (postpaid standard report), not
@@ -83,18 +62,3 @@ export const DEVICE_METER_ADDRESS = '00102608220004';
 
 /** The 6 bytes the same device sends immediately before its first frame. */
 export const DEVICE_PREAMBLE = Buffer.from('A345A3C50000', 'hex');
-
-/** Build a datalogger body from records, matching the device's wire format. */
-export function buildDatalog(records) {
-  const buf = Buffer.alloc(1 + records.length * 20);
-  buf[0] = records.length;
-  records.forEach((r, i) => {
-    const at = 1 + i * 20;
-    buf.writeUInt32LE(r.timestamp, at);
-    buf.writeFloatLE(r.battery, at + 4);
-    buf.writeFloatLE(r.temperature, at + 8);
-    buf.writeFloatLE(r.waterLevel, at + 12);
-    buf.writeFloatLE(r.barometric, at + 16);
-  });
-  return buf;
-}

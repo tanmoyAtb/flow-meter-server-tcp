@@ -1,6 +1,6 @@
 // Console formatting for incoming data. The point of this server right now is
-// to see what devices are sending, so both endpoints log the decoded payload in
-// full rather than a summary line.
+// to see what the meters are sending, so reports are logged in full rather than
+// as a summary line.
 
 const DASH = '—';
 
@@ -18,37 +18,6 @@ function activeAlarms(alarms) {
     .filter(([, v]) => v)
     .map(([k]) => k);
   return on.length ? on.join(', ') : 'none';
-}
-
-export function formatMeterReading(reading, hex, { duplicate, encoding, source = 'coap_push' }) {
-  const p = reading.payload;
-  const nonZero = p.increments.filter((s) => s.value !== 0 && s.value !== null);
-  const shown = nonZero
-    .slice(0, 8)
-    .map((s) => `${s.time} ${s.value}`)
-    .join(' · ');
-
-  const lines = [
-    rule(`${source}  ${reading.address}${duplicate ? '  (duplicate)' : ''}`),
-    `  raw     ${hex}`,
-    `  frame   ${reading.meterType} meter · ${encoding} · ${hex.length / 2} bytes · DI ${reading.dataIdentifier} · SER ${reading.ser}`,
-    `  time    ${p.meterTime.iso ?? p.meterTime.raw}   (meter local)`,
-    `  flow    cumulative ${num(p.cumulativeFlow.value, 'm3')}   settlement ${num(p.settlementFlow.value, 'm3')}   reverse ${num(p.reverseFlow.value, 'm3')}   remaining ${num(p.remainingFlow.value, 'm3')}`,
-    `  rate    ${num(p.flowRate.value, 'm3/h')}   temp ${num(p.temperature.value, 'C')}   pressure ${num(p.pressure.value, 'MPa')}   ultrasonic ${p.ultrasonicSignal}`,
-    `  status  valve ${p.status.valve}   battery ${p.status.batteryVoltageLow ? 'LOW' : 'ok'}   alarms: ${activeAlarms(p.status.alarms)}`,
-    `  radio   ${num(p.signalStrength, 'dBm')}   quality ${p.signalQuality}   transmission #${p.transmissionCount}`,
-    `  sim     IMEI ${p.imei}   ICCID ${p.iccid}`,
-    `  config  uploads at ${p.timingScheme.map((h) => `${String(h).padStart(2, '0')}:00`).join(', ') || DASH}   flag ${p.uploadFlag}`,
-    `  freeze  cutoff ${String(p.freeze.cutoffHour ?? 0).padStart(2, '0')}:00 at ${num(p.freeze.cutoffFlow, 'm3')}`,
-    `  usage   ${nonZero.length}/${p.increments.length} half-hour slots non-zero${shown ? `: ${shown}${nonZero.length > 8 ? ` · +${nonZero.length - 8} more` : ''}` : ''}`,
-  ];
-
-  if (p.slotCountMismatch) {
-    lines.push(
-      `  WARNING expected ${p.slotCountMismatch.expected} half-hour slots, got ${p.slotCountMismatch.got}`,
-    );
-  }
-  return lines.join('\n');
 }
 
 /** CAT-1 packet type 03: a postpaid meter's periodic report. */
@@ -125,7 +94,8 @@ export function formatUnrecognisedFrame(bytes, envelope, reason, { peer }) {
     `  raw     ${hexOf(bytes)}`,
     `  frame   ${type} meter · ${bytes.length} bytes · C ${hx(envelope.control)} · L ${hx(envelope.dataLength)}`,
     `  reason  ${reason}`,
-    '  note    envelope is valid CJ/T 188; the payload layout is not the 9097 upload',
+    '  note    the 68H…16H envelope is shared by several meter protocols, so a',
+    '          valid envelope here does not make the payload CAT-1',
   ].join('\n');
 }
 
@@ -139,21 +109,4 @@ export function formatUnframedBytes(bytes, { peer }) {
     `  ascii   ${printable}`,
     `  bytes   ${bytes.length}   (no 68H…16H frame; logged so nothing is lost)`,
   ].join('\n');
-}
-
-export function formatDatalog(deviceId, records, { inserted, duplicates }) {
-  const lines = [
-    rule(`datalogs  ${deviceId}`),
-    `  ${records.length} record(s) · ${inserted} new · ${duplicates} duplicate`,
-  ];
-
-  for (const r of records) {
-    const when = new Date(r.timestamp * 1000).toISOString().replace('.000Z', 'Z');
-    lines.push(
-      `  ${when}  batt ${num(r.battery, 'V', 2)}  temp ${num(r.temperature, 'C', 1)}` +
-        `  level ${r.waterLevel === null ? `${DASH} (invalid)` : num(r.waterLevel, 'm', 3)}` +
-        `  baro ${num(r.barometric, 'hPa', 1)}`,
-    );
-  }
-  return lines.join('\n');
 }

@@ -4,87 +4,72 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { openStore } from '../src/store/memory.js';
-import { parseUplink } from '../src/lib/cjt188.js';
-import { REFERENCE_FRAME, REFERENCE_FRAME_HEX } from './fixtures.js';
+import { parseCat1 } from '../src/lib/cat1.js';
+import { CAT1_FRAMES, CAT1_FRAMES_HEX, DEVICE_METER_ADDRESS } from './fixtures.js';
 
-const record = (timestamp) => ({
-  timestamp,
-  battery: 3.7,
-  temperature: 21.5,
-  waterLevel: 1.2,
-  barometric: 1013,
-});
+const reading = (i = 0) => parseCat1(CAT1_FRAMES[i]);
+const hex = (i = 0) => CAT1_FRAMES_HEX[i].toUpperCase();
 
-test('datalog dedup is per (device, timestamp)', () => {
+test('cat1 dedup is per (address, report count, meter clock)', () => {
   const store = openStore();
 
-  assert.deepEqual(store.saveDatalog('A', [record(1), record(2)]), { inserted: 2, duplicates: 0 });
-  assert.deepEqual(store.saveDatalog('A', [record(1), record(2)]), { inserted: 0, duplicates: 2 });
-
-  // Overlapping batch: only the unseen timestamp lands.
-  assert.deepEqual(store.saveDatalog('A', [record(2), record(3)]), { inserted: 1, duplicates: 1 });
-
-  // Same timestamps, different device -- not a duplicate.
-  assert.deepEqual(store.saveDatalog('B', [record(1)]), { inserted: 1, duplicates: 0 });
-
-  assert.equal(store.datalogReadings('A').length, 3);
-  assert.equal(store.datalogReadings('B').length, 1);
-  assert.equal(store.datalogReadings().length, 4);
-});
-
-test('meter dedup is per (address, meter time)', () => {
-  const store = openStore();
-  const reading = parseUplink(REFERENCE_FRAME);
-
-  const first = store.saveMeterReading(reading, REFERENCE_FRAME_HEX);
+  const first = store.saveCat1Reading(reading(0), hex(0));
   assert.equal(first.duplicate, false);
   assert.ok(first.id);
 
-  const second = store.saveMeterReading(reading, REFERENCE_FRAME_HEX);
+  const second = store.saveCat1Reading(reading(0), hex(0));
   assert.equal(second.duplicate, true);
   assert.equal(second.id, null);
 
-  assert.equal(store.meterReadings().length, 1);
+  assert.equal(store.cat1Readings().length, 1);
 
-  // Same meter, a later reading -- stored alongside, not deduped.
-  const later = structuredClone({ ...reading, payload: reading.payload });
-  later.payload.meterTime = { ...reading.payload.meterTime, iso: '2021-08-26T08:14:46' };
-  assert.equal(store.saveMeterReading(later, REFERENCE_FRAME_HEX).duplicate, false);
-  assert.equal(store.meterReadings('21081300004575').length, 2);
+  // The next captured frame steps the report counter, so it is a new reading
+  // even though no water was drawn between the two.
+  assert.equal(store.saveCat1Reading(reading(1), hex(1)).duplicate, false);
+  assert.equal(store.cat1Readings(DEVICE_METER_ADDRESS).length, 2);
+});
+
+test('the clock guards against a report counter that restarted', () => {
+  const store = openStore();
+  store.saveCat1Reading(reading(0), hex(0));
+
+  // Same counter, different clock: a meter that was power-cycled, not a resend.
+  const restarted = reading(0);
+  restarted.payload.meterClock = { ...restarted.payload.meterClock, iso: '2023-09-24T06:02:46' };
+  assert.equal(store.saveCat1Reading(restarted, hex(0)).duplicate, false);
+  assert.equal(store.cat1Readings().length, 2);
 });
 
 test('a stored reading is a snapshot, not a live reference', () => {
   const store = openStore();
-  const reading = parseUplink(REFERENCE_FRAME);
-  store.saveMeterReading(reading, REFERENCE_FRAME_HEX);
+  const r = reading(0);
+  store.saveCat1Reading(r, hex(0));
 
-  reading.payload.status.alarms.emptyPipe = false;
-  assert.equal(store.meterReadings()[0].alarms.emptyPipe, true, 'alarms were copied on write');
+  r.reportingTriggers.push('mutated after the write');
+  assert.equal(store.cat1Readings()[0].reportingTriggers.length, 1, 'triggers were copied on write');
 });
 
 test('failures are recorded and truncated', () => {
   const store = openStore();
-  store.recordFailure('coap_push', 'bad_checksum: nope', 'a'.repeat(9000));
-  store.recordFailure('datalogs', 'bad_length: nope', null);
+  store.recordFailure('tcp', 'bad_checksum: nope', 'a'.repeat(9000));
+  store.recordFailure('tcp', 'not_cat1: not a CAT-1 frame', null);
 
   assert.equal(store.ingestFailures().length, 2);
-  assert.equal(store.ingestFailures('coap_push').length, 1);
-  assert.equal(store.ingestFailures('coap_push')[0].body.length, 4096);
-  assert.equal(store.ingestFailures('datalogs')[0].body, null);
+  assert.equal(store.ingestFailures('tcp').length, 2);
+  assert.equal(store.ingestFailures('tcp')[0].body.length, 4096);
+  assert.equal(store.ingestFailures('tcp')[1].body, null);
 });
 
 test('reset clears rows and dedup keys together', () => {
   const store = openStore();
-  store.saveDatalog('A', [record(1)]);
-  store.recordFailure('datalogs', 'x', null);
+  store.saveCat1Reading(reading(0), hex(0));
+  store.recordFailure('tcp', 'x', null);
   store.reset();
 
   assert.deepEqual(store.snapshot().counts, {
-    datalogReadings: 0,
-    meterReadings: 0,
     cat1Readings: 0,
     ingestFailures: 0,
   });
   // The dedup key must be gone too, or the row can never be re-added.
-  assert.deepEqual(store.saveDatalog('A', [record(1)]), { inserted: 1, duplicates: 0 });
+  assert.equal(store.saveCat1Reading(reading(0), hex(0)).duplicate, false);
 });

@@ -1,4 +1,4 @@
-// The auto-reconcile policy: one report in, at most one command out.
+// The auto-configure policy: one report in, at most one command out.
 //
 // The fixture frame is convenient here because it is wrong in both ways at
 // once -- its clock reads 2023-09-23 and its table type code is 0027, which is
@@ -9,12 +9,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 
-import { createReconciler, clockSkewSeconds, RECONCILE_DEFAULTS, reconcileOptionsFromEnv } from '../src/reconcile.js';
+import { createConfigurer, clockSkewSeconds, CONFIGURE_DEFAULTS, configureOptionsFromEnv } from '../src/configure.js';
 import { createMeterConnectionHandler } from '../src/tcp.js';
 import { openStore } from '../src/store/memory.js';
 import { createCommandQueue } from '../src/commands.js';
 import { decodeCat1Frame, decodePayload, ACK_CONTROL, METERING_MODE_BYTES } from '../src/lib/cat1.js';
-import { checksum } from '../src/lib/cjt188.js';
+import { checksum } from '../src/lib/frame.js';
 import { CAT1_FRAME, DEVICE_METER_ADDRESS } from './fixtures.js';
 
 const silent = { info: () => {}, warn: () => {}, error: () => {} };
@@ -69,7 +69,7 @@ test('unreadable BCD is not mistaken for a clock at the epoch', () => {
 // --- the ladder -----------------------------------------------------------
 
 test('a wrong clock outranks a wrong resolution', () => {
-  const { command } = createReconciler().decide(read(CAT1_FRAME));
+  const { command } = createConfigurer().decide(read(CAT1_FRAME));
   assert.equal(command.type, 'set_clock');
   // The fixture is also at 1000 L, and that is deliberately not what came back:
   // AA00 must be alone and first in a contact, so it goes first.
@@ -78,7 +78,7 @@ test('a wrong clock outranks a wrong resolution', () => {
 
 test('once the clock is right the resolution is next', () => {
   const frame = frameWith({ clock: [26, 8, 5, 12, 0, 0] });
-  const { command } = createReconciler().decide(read(frame), new Date(dhakaNowFor('2026-08-05T12:00:00')));
+  const { command } = createConfigurer().decide(read(frame), new Date(dhakaNowFor('2026-08-05T12:00:00')));
   assert.equal(command.type, 'set_metering');
   assert.equal(command.params.fromLitres, 1000);
   assert.equal(command.params.toLitres, 1);
@@ -87,27 +87,27 @@ test('once the clock is right the resolution is next', () => {
 
 test('a meter that is already correct is left alone', () => {
   const frame = frameWith({ clock: [26, 8, 5, 12, 0, 0], tableTypeCode: CODE_FOR[1] });
-  const decision = createReconciler().decide(read(frame), new Date(dhakaNowFor('2026-08-05T12:00:00')));
+  const decision = createConfigurer().decide(read(frame), new Date(dhakaNowFor('2026-08-05T12:00:00')));
   assert.equal(decision.command, null);
   assert.deepEqual(decision.notes, []);
 });
 
 test('small skew is drift, not a wrong time zone', () => {
   const frame = frameWith({ clock: [26, 8, 5, 12, 0, 45], tableTypeCode: CODE_FOR[1] });
-  const decision = createReconciler().decide(read(frame), new Date(dhakaNowFor('2026-08-05T12:00:00')));
+  const decision = createConfigurer().decide(read(frame), new Date(dhakaNowFor('2026-08-05T12:00:00')));
   assert.equal(decision.command, null, '45s is inside the tolerance');
 });
 
 test('the target resolution is configurable and 10 L meters are then left alone', () => {
   const frame = frameWith({ clock: [26, 8, 5, 12, 0, 0], tableTypeCode: CODE_FOR[10] });
   const at = (resolutionLitres) =>
-    createReconciler({ resolutionLitres }).decide(read(frame), new Date(dhakaNowFor('2026-08-05T12:00:00')));
+    createConfigurer({ resolutionLitres }).decide(read(frame), new Date(dhakaNowFor('2026-08-05T12:00:00')));
   assert.equal(at(10).command, null);
   assert.equal(at(1).command.type, 'set_metering');
 });
 
 test('an impossible target resolution is refused at construction', () => {
-  assert.throws(() => createReconciler({ resolutionLitres: 500 }), /must be one of/);
+  assert.throws(() => createConfigurer({ resolutionLitres: 500 }), /must be one of/);
 });
 
 // --- the valve interlock --------------------------------------------------
@@ -118,11 +118,11 @@ test('AA07 is withheld from a meter whose valve is shut', () => {
   const frame = frameWith({ clock: [26, 8, 5, 12, 0, 0], statusWord: 0x0001 }); // valve closed
   const now = new Date(dhakaNowFor('2026-08-05T12:00:00'));
 
-  const held = createReconciler().decide(read(frame), now);
+  const held = createConfigurer().decide(read(frame), now);
   assert.equal(held.command, null);
   assert.match(held.notes[0], /valve is closed; AA07 would open it/);
 
-  const forced = createReconciler({ allowClosedValve: true }).decide(read(frame), now);
+  const forced = createConfigurer({ allowClosedValve: true }).decide(read(frame), now);
   assert.equal(forced.command.type, 'set_metering');
 });
 
@@ -130,63 +130,77 @@ test('holding for a closed valve does not burn an attempt', () => {
   const closed = read(frameWith({ clock: [26, 8, 5, 12, 0, 0], statusWord: 0x0001 }));
   const open = read(frameWith({ clock: [26, 8, 5, 12, 0, 0], statusWord: 0x0000 }));
   const now = new Date(dhakaNowFor('2026-08-05T12:00:00'));
-  const reconciler = createReconciler({ maxAttempts: 1 });
+  const configurer = createConfigurer({ maxAttempts: 1 });
 
-  for (let i = 0; i < 5; i++) assert.equal(reconciler.decide(closed, now).command, null);
-  assert.equal(reconciler.decide(open, now).command.type, 'set_metering', 'eligible as soon as the valve opens');
+  for (let i = 0; i < 5; i++) assert.equal(configurer.decide(closed, now).command, null);
+  assert.equal(configurer.decide(open, now).command.type, 'set_metering', 'eligible as soon as the valve opens');
 });
 
 // --- not looping forever --------------------------------------------------
 
 test('a meter that never complies is given up on, and said so', () => {
-  const reconciler = createReconciler({ maxAttempts: 3 });
+  const configurer = createConfigurer({ maxAttempts: 3 });
   // Resolution already correct, so the clock is the only rung in play.
   const reading = read(frameWith({ tableTypeCode: CODE_FOR[1] }));
 
   for (let i = 0; i < 3; i++) {
-    assert.equal(reconciler.decide(reading).command.type, 'set_clock', `attempt ${i + 1}`);
+    assert.equal(configurer.decide(reading).command.type, 'set_clock', `attempt ${i + 1}`);
   }
-  const exhausted = reconciler.decide(reading);
+  const exhausted = configurer.decide(reading);
   assert.equal(exhausted.command, null);
   assert.match(exhausted.notes[0], /clock still .* after 3 attempts/);
-  assert.equal(reconciler.state()[DEVICE_METER_ADDRESS].set_clock, 3);
+  assert.equal(configurer.state()[DEVICE_METER_ADDRESS].set_clock, 3);
 });
 
 test('giving up on the clock still lets the resolution be fixed', () => {
-  const reconciler = createReconciler({ maxAttempts: 1 });
+  const configurer = createConfigurer({ maxAttempts: 1 });
   const reading = read(CAT1_FRAME); // wrong clock AND 1000 L
-  assert.equal(reconciler.decide(reading).command.type, 'set_clock');
+  assert.equal(configurer.decide(reading).command.type, 'set_clock');
 
-  const next = reconciler.decide(reading);
+  const next = configurer.decide(reading);
   assert.equal(next.command.type, 'set_metering', 'the rungs are independent');
   assert.match(next.notes[0], /clock still/);
 });
 
 test('a meter that complies has its attempts forgiven', () => {
-  const reconciler = createReconciler({ maxAttempts: 2 });
+  const configurer = createConfigurer({ maxAttempts: 2 });
   const now = new Date(dhakaNowFor('2026-08-05T12:00:00'));
-  assert.equal(reconciler.decide(read(CAT1_FRAME)).command.type, 'set_clock');
+  assert.equal(configurer.decide(read(CAT1_FRAME)).command.type, 'set_clock');
 
   // It obeyed, so the count resets and a later drift gets a full budget again.
   const fixed = read(frameWith({ clock: [26, 8, 5, 12, 0, 0] }));
-  reconciler.decide(fixed, now);
-  assert.equal(reconciler.state()[DEVICE_METER_ADDRESS].set_clock, undefined);
+  configurer.decide(fixed, now);
+  assert.equal(configurer.state()[DEVICE_METER_ADDRESS].set_clock, undefined);
 });
 
 // --- configuration --------------------------------------------------------
 
 test('the environment is read with safe defaults', () => {
-  assert.deepEqual(reconcileOptionsFromEnv({}), {
+  assert.deepEqual(configureOptionsFromEnv({}), {
     enabled: true,
-    timeZone: RECONCILE_DEFAULTS.timeZone,
+    timeZone: CONFIGURE_DEFAULTS.timeZone,
     resolutionLitres: 1,
     clockToleranceSeconds: 120,
     maxAttempts: 3,
     allowClosedValve: false,
   });
-  assert.equal(reconcileOptionsFromEnv({ RECONCILE: '0' }).enabled, false);
-  assert.equal(reconcileOptionsFromEnv({ RECONCILE_ALLOW_CLOSED_VALVE: '1' }).allowClosedValve, true);
-  assert.equal(reconcileOptionsFromEnv({ RECONCILE_TIMEZONE: 'UTC' }).timeZone, 'UTC');
+  assert.equal(configureOptionsFromEnv({ CONFIGURE: '0' }).enabled, false);
+  assert.equal(configureOptionsFromEnv({ CONFIGURE_ALLOW_CLOSED_VALVE: '1' }).allowClosedValve, true);
+  assert.equal(configureOptionsFromEnv({ CONFIGURE_TIMEZONE: 'UTC' }).timeZone, 'UTC');
+});
+
+test('the old RECONCILE_* names still work, because a deployed unit file uses them', () => {
+  // `Environment=RECONCILE=0` is what holds the policy OFF on 65.2.232.159. If
+  // renaming the code silently ignored that, the policy would come up ON there
+  // and start writing AA07 unattended -- which opens valves.
+  assert.equal(configureOptionsFromEnv({ RECONCILE: '0' }).enabled, false);
+  assert.equal(configureOptionsFromEnv({ RECONCILE_ALLOW_CLOSED_VALVE: '1' }).allowClosedValve, true);
+  assert.equal(configureOptionsFromEnv({ RECONCILE_TIMEZONE: 'UTC' }).timeZone, 'UTC');
+  assert.equal(configureOptionsFromEnv({ RECONCILE_MAX_ATTEMPTS: '7' }).maxAttempts, 7);
+
+  // The new name wins where both are set.
+  assert.equal(configureOptionsFromEnv({ CONFIGURE_TIMEZONE: 'UTC', RECONCILE_TIMEZONE: 'Asia/Tokyo' }).timeZone, 'UTC');
+  assert.equal(configureOptionsFromEnv({ CONFIGURE: '0', RECONCILE: '1' }).enabled, false);
 });
 
 // --- through the connection handler ---------------------------------------
@@ -220,7 +234,7 @@ function connect(opts = {}) {
 
 test('a report from a wrong meter is answered with a command, not an ack', () => {
   const commands = createCommandQueue();
-  const socket = connect({ commands, reconciler: createReconciler() });
+  const socket = connect({ commands, configurer: createConfigurer() });
   socket.emit('data', CAT1_FRAME);
 
   assert.equal(socket.writes.length, 1, 'one command, and no stay-awake ack before it');
@@ -234,8 +248,8 @@ test('a report from a wrong meter is answered with a command, not an ack', () =>
 test('a correct meter just gets its power-off ack', () => {
   const frame = frameWith({ clock: [26, 8, 5, 12, 0, 0], tableTypeCode: CODE_FOR[1] });
   const commands = createCommandQueue();
-  // Freeze the comparison by handing the reconciler a matching zone offset.
-  const socket = connect({ commands, reconciler: createReconciler({ clockToleranceSeconds: 10 ** 9 }) });
+  // Freeze the comparison by handing the configurer a matching zone offset.
+  const socket = connect({ commands, configurer: createConfigurer({ clockToleranceSeconds: 10 ** 9 }) });
   socket.emit('data', frame);
 
   assert.equal(socket.writes.length, 1);
@@ -249,7 +263,7 @@ test('the policy outranks a hand-queued command', () => {
     type: 'valve',
     build: () => Buffer.from('68100400220826100003040001000008aa05995a0000000000000000f316', 'hex'),
   });
-  const socket = connect({ commands, reconciler: createReconciler() });
+  const socket = connect({ commands, configurer: createConfigurer() });
   socket.emit('data', CAT1_FRAME);
 
   assert.equal(socket.writes[0].readUInt16BE(16), 0xaa00, 'the clock, not the queued valve command');
@@ -263,7 +277,7 @@ test('the policy contributes at most one command per report', () => {
   // Wrong in both ways at once: clock reads 2023 and resolution is 1000 L. Only
   // the clock goes out -- the resolution waits for the next contact.
   const commands = createCommandQueue();
-  const socket = connect({ commands, reconciler: createReconciler() });
+  const socket = connect({ commands, configurer: createConfigurer() });
   socket.emit('data', CAT1_FRAME);
 
   assert.equal(socket.writes.length, 1, 'one command, not one per rung');
@@ -280,7 +294,7 @@ test('a queued command gets its turn once the policy has nothing left to do', ()
     type: 'valve',
     build: () => Buffer.from('68100400220826100003040001000008aa05995a0000000000000000f316', 'hex'),
   });
-  const socket = connect({ commands, reconciler: createReconciler({ clockToleranceSeconds: 10 ** 9 }) });
+  const socket = connect({ commands, configurer: createConfigurer({ clockToleranceSeconds: 10 ** 9 }) });
   socket.emit('data', frame);
 
   assert.equal(socket.writes[0].readUInt16BE(16), 0xaa05, 'the valve command goes out');
@@ -288,8 +302,8 @@ test('a queued command gets its turn once the policy has nothing left to do', ()
 
 test('only one command goes out per contact', () => {
   const commands = createCommandQueue();
-  const reconciler = createReconciler();
-  const socket = connect({ commands, reconciler });
+  const configurer = createConfigurer();
+  const socket = connect({ commands, configurer });
 
   // Two reports on one connection: each gets exactly one command back.
   socket.emit('data', CAT1_FRAME);
@@ -298,14 +312,14 @@ test('only one command goes out per contact', () => {
   for (const write of socket.writes) assert.equal(write.readUInt16BE(16), 0xaa00);
 });
 
-test('an undecodable payload is still acknowledged and never reconciled', () => {
+test('an undecodable payload is still acknowledged and never configured', () => {
   // Packet type 04 has no decoder. The meter must still be told to sleep.
   const buf = Buffer.from(CAT1_FRAME);
   buf[16] = 0x04;
   buf[buf.length - 2] = checksum(buf);
 
   const commands = createCommandQueue();
-  const socket = connect({ commands, reconciler: createReconciler() });
+  const socket = connect({ commands, configurer: createConfigurer() });
   socket.emit('data', buf);
 
   assert.equal(socket.writes.length, 1);

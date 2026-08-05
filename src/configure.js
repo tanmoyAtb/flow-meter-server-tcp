@@ -18,11 +18,11 @@
 //   2. resolution not the target      -> AA07
 //   3. nothing wrong                  -> no command, just the power-off ack
 //
-// See the "Auto-reconcile" section of the README for the operational picture.
+// See the "Auto-configure" section of the README for the operational picture.
 
 import { encodeSetClock, encodeSetMeterType, clockParts, METERING_MODE_BYTES } from './lib/cat1.js';
 
-export const RECONCILE_DEFAULTS = {
+export const CONFIGURE_DEFAULTS = {
   timeZone: 'Asia/Dhaka',
   resolutionLitres: 1,
   /**
@@ -59,16 +59,26 @@ export const RECONCILE_DEFAULTS = {
   allowClosedValve: false,
 };
 
-/** Read the policy out of the environment, for the server entry point. */
-export function reconcileOptionsFromEnv(env = process.env) {
-  const num = (name, fallback) => (env[name] === undefined ? fallback : Number(env[name]));
+/**
+ * Read the policy out of the environment, for the server entry point.
+ *
+ * The RECONCILE_* names are the ones this was born with and are still honoured,
+ * because `Environment=RECONCILE=0` is what holds the policy OFF in a deployed
+ * systemd unit. Dropping the old spelling would turn the policy silently ON on
+ * any box whose unit file was not updated in the same breath as the code -- and
+ * "silently ON" here means unattended AA07 writes, which open valves. CONFIGURE_*
+ * wins where both are set.
+ */
+export function configureOptionsFromEnv(env = process.env) {
+  const str = (name) => env[`CONFIGURE_${name}`] ?? env[`RECONCILE_${name}`];
+  const num = (name, fallback) => (str(name) === undefined ? fallback : Number(str(name)));
   return {
-    enabled: env.RECONCILE !== '0',
-    timeZone: env.RECONCILE_TIMEZONE ?? RECONCILE_DEFAULTS.timeZone,
-    resolutionLitres: num('RECONCILE_RESOLUTION_LITRES', RECONCILE_DEFAULTS.resolutionLitres),
-    clockToleranceSeconds: num('RECONCILE_CLOCK_TOLERANCE_S', RECONCILE_DEFAULTS.clockToleranceSeconds),
-    maxAttempts: num('RECONCILE_MAX_ATTEMPTS', RECONCILE_DEFAULTS.maxAttempts),
-    allowClosedValve: env.RECONCILE_ALLOW_CLOSED_VALVE === '1',
+    enabled: (env.CONFIGURE ?? env.RECONCILE) !== '0',
+    timeZone: str('TIMEZONE') ?? CONFIGURE_DEFAULTS.timeZone,
+    resolutionLitres: num('RESOLUTION_LITRES', CONFIGURE_DEFAULTS.resolutionLitres),
+    clockToleranceSeconds: num('CLOCK_TOLERANCE_S', CONFIGURE_DEFAULTS.clockToleranceSeconds),
+    maxAttempts: num('MAX_ATTEMPTS', CONFIGURE_DEFAULTS.maxAttempts),
+    allowClosedValve: str('ALLOW_CLOSED_VALVE') === '1',
   };
 }
 
@@ -94,8 +104,8 @@ export function clockSkewSeconds(meterClockIso, now, timeZone) {
  * on restart is the right failure mode. A restart re-tries, which is what you
  * want after deploying a fix.
  */
-export function createReconciler(options = {}) {
-  const config = { ...RECONCILE_DEFAULTS, ...options };
+export function createConfigurer(options = {}) {
+  const config = { ...CONFIGURE_DEFAULTS, ...options };
   const meteringMode = METERING_MODE_BYTES[config.resolutionLitres];
   if (meteringMode === undefined) {
     throw new Error(
@@ -158,7 +168,7 @@ export function createReconciler(options = {}) {
             command: {
               type: 'set_clock',
               reason: `meter clock ${payload.meterClock.iso} is ${skew}s off ${config.timeZone}`,
-              params: { timeZone: config.timeZone, skewSeconds: skew, source: 'reconciler' },
+              params: { timeZone: config.timeZone, skewSeconds: skew, source: 'configurer' },
               build: (instructionNumber) =>
                 encodeSetClock(target, new Date(), instructionNumber, { timeZone: config.timeZone }),
             },
@@ -178,7 +188,7 @@ export function createReconciler(options = {}) {
           // meter becomes eligible again the moment its valve is opened.
           notes.push(
             `resolution is ${actual} L but valve is ${valve}; AA07 would open it ` +
-              `(RECONCILE_ALLOW_CLOSED_VALVE=1 to override)`,
+              `(CONFIGURE_ALLOW_CLOSED_VALVE=1 to override)`,
           );
         } else if (claim(address, 'set_metering')) {
           return {
@@ -186,7 +196,7 @@ export function createReconciler(options = {}) {
             command: {
               type: 'set_metering',
               reason: `resolution is ${actual} L, want ${config.resolutionLitres} L`,
-              params: { fromLitres: actual, toLitres: config.resolutionLitres, meteringMode, source: 'reconciler' },
+              params: { fromLitres: actual, toLitres: config.resolutionLitres, meteringMode, source: 'configurer' },
               build: (instructionNumber) => encodeSetMeterType(target, { meteringMode }, instructionNumber),
             },
           };

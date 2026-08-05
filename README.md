@@ -1,8 +1,8 @@
 # water-meter-check
 
-Express ingest server for the two endpoints in [api.txt](api.txt): the Hydrosense
-binary datalogger push, and the NB-IoT CJ/T 188 meter frame push forwarded by the
-IoT platform (Telecom AEP / China Mobile OneNet).
+Ingest and command server for CAT-1 NB-IoT water meters. The meters open a raw
+TCP connection and push a frame; the server decodes it, answers on the same
+socket, and can send the meter a command in that reply.
 
 Runtime dependencies: Express and Mongoose.
 
@@ -14,7 +14,7 @@ in plain arrays and starts empty every time. The Mongoose models in
 ```bash
 npm install
 npm run build   # TypeScript -> dist/
-npm test        # 207 tests (14 skip without a mongod)
+npm test        # 189 tests (13 skip without a mongod)
 npm start       # PORT=3000 by default
 ```
 
@@ -61,60 +61,28 @@ compiled output, which is what actually gets imported at runtime.
 
 ## Console output
 
-Both endpoints log the full decoded payload as it arrives — the raw frame plus
+Every report logs the full decoded payload as it arrives — the raw frame plus
 every field, not a summary. Bad frames log the specific reason (`bad_checksum`,
-`too_short`, …).
+`too_short`, `not_cat1`, …) together with the raw bytes.
 
 ```
-─── coap_push  21081300004575 ───────────────────────────────
-  raw     68107545000013082181AC9097002B6066...2CD8E616
-  frame   water meter · hex · 185 bytes · DI 9097 · SER 0
-  time    2021-08-26T04:14:46   (meter local)
-  flow    cumulative 206.66 m3   settlement 18.03 m3   reverse 0 m3   remaining 0 m3
-  rate    0 m3/h   temp 27.92 C   pressure 0 MPa   ultrasonic 0
-  status  valve open   battery ok   alarms: emptyPipe
-  radio   -76 dBm   quality 18   transmission #11
-  sim     IMEI 864823047988050   ICCID 89861119253017474430
-  config  uploads at 04:00   flag 1
-  freeze  cutoff 00:00 at 206.66 m3
-  usage   26/47 half-hour slots non-zero: 13:30 3.95 · 13:00 1.94 · … · +18 more
-
-─── datalogs  HS-GWL-0042 ───────────────────────────────────
-  2 record(s) · 2 new · 0 duplicate
-  2025-01-27T17:46:40Z  batt 3.70 V  temp 21.5 C  level 1.234 m  baro 1013.2 hPa
-  2025-01-27T17:56:40Z  batt 3.69 V  temp 21.4 C  level — (invalid)  baro 1013.1 hPa
+─── tcp  00102608220004 ─────────────────────────────────────
+  raw     6810040022082610000397000000024603C22C00...7416
+  frame   CAT-1 · cold water meter · 88 bytes · packet postpaid_standard
+  trigger trigger   report #16 (today #2)
+  time    2023-09-23T06:02:46   (meter clock)
+  usage   cumulative 1.000 m3 (1000 L)   today 0.000 m3   month 0.000 m3
+  meter   postpaid · switch valve · counts in 1000 L steps
+  status  valve open   battery ok 3.614 V   alarms: none
+  radio   -94 dBm RSSI   -9 dB RSRQ   23 dB SNR
+  sim     IMEI 867512079825846   ICCID 89860422152570009782
+  config  reports every 1440 minutes   mfr C22C   hw 0306   sw 0300
 ```
 
-Formatting lives in `src/lib/format.js`. Routes log through an injected logger,
-so tests silence it by passing no-op `info`/`warn`/`error`.
+Formatting lives in `src/lib/format.js`. The TCP handler logs through an injected
+logger, so tests silence it by passing no-op `info`/`warn`/`error`.
 
 ## Endpoints
-
-### `POST /api/v1/datalogs/:deviceId`
-
-Body is `[count: 1 byte][count × 20-byte records]`, little-endian, count 1–100.
-Each record is `uint32` unix seconds + four `float32`s (battery V, temperature °C,
-water level m, barometric — parsed but not used). A water level of `999` is the
-device's invalid sentinel and is stored as `NULL`.
-
-- `200` empty body — saved, device clears its queue
-- `400` — bad frame, device retries
-- `500` — server fault; deliberately *not* `400`, so the device keeps its buffer
-
-Deduplicated on `(device_id, timestamp)`, so retries are safe.
-
-### `POST /api/v1/coap_push`
-
-Accepts the frame as raw hex text, raw binary, JSON containing hex, or JSON
-containing base64. For JSON the payload is found by walking the object for the
-first string that decodes to a `68…16` frame, so platform-specific wrapper shapes
-don't need to be configured.
-
-Always answers `200` — platforms retry on any non-200, and a frame that fails to
-parse will never parse on retry. Failures come back as `{"ok": false, "reason": …}`
-and are written to the `ingest_failures` table rather than dropped.
-
-Deduplicated on `(meter_address, meter_time)`.
 
 ### `POST /api/v1/meters/:address/server-address`
 
@@ -155,14 +123,11 @@ testing. Both are unauthenticated and exist only for the mock; remove them when
 a real store goes in.
 
 ```
-$ curl -X POST localhost:3000/api/v1/coap_push -d '68107545...E616'
-{"ok":true,"duplicate":false,"encoding":"hex","meter_address":"21081300004575",
- "meter_time":"2021-08-26T04:14:46","cumulative_flow":206.66,"temperature":27.92,
- "valve_status":"open","signal_strength":-76,"imei":"864823047988050",
- "alarms":{"emptyPipe":true,...},"increments":[{"time":"23:30","value":0},...]}
+$ curl -s localhost:3000/debug/store | jq .counts
+{"cat1Readings": 41, "ingestFailures": 7}
 ```
 
-## Auto-reconcile
+## Auto-configure
 
 Field meters are brought to a target configuration without anyone queueing
 commands for them. Every CAT-1 report is checked against the policy, and the
@@ -170,7 +135,7 @@ meter is answered with **at most one command**, chosen from a ladder:
 
 | | condition | command |
 |---|---|---|
-| 1 | meter clock more than `RECONCILE_CLOCK_TOLERANCE_S` off the target zone | `AA00` clock |
+| 1 | meter clock more than `CONFIGURE_CLOCK_TOLERANCE_S` off the target zone | `AA00` clock |
 | 2 | table type code resolution ≠ target | `AA07` meter type |
 | 3 | nothing wrong | power-off ack only |
 
@@ -189,17 +154,24 @@ the loop is self-checking. It is also self-healing — a replaced or reset meter
 is corrected the first time it reports.
 
 ```
-RECONCILE=0                       turn it off; server becomes a pure collector
-RECONCILE_TIMEZONE=Asia/Dhaka     IANA zone the meter clock should read
-RECONCILE_RESOLUTION_LITRES=1     1 | 10 | 100 | 1000
-RECONCILE_CLOCK_TOLERANCE_S=120   below this, treat skew as drift, not a wrong zone
-RECONCILE_MAX_ATTEMPTS=3          per meter, per setting, before giving up
-RECONCILE_ALLOW_CLOSED_VALVE=0    see below — leave at 0
+CONFIGURE=0                       turn it off; server becomes a pure collector
+CONFIGURE_TIMEZONE=Asia/Dhaka     IANA zone the meter clock should read
+CONFIGURE_RESOLUTION_LITRES=1     1 | 10 | 100 | 1000
+CONFIGURE_CLOCK_TOLERANCE_S=120   below this, treat skew as drift, not a wrong zone
+CONFIGURE_MAX_ATTEMPTS=3          per meter, per setting, before giving up
+CONFIGURE_ALLOW_CLOSED_VALVE=0    see below — leave at 0
 ```
 
-`GET /api/v1/reconcile` reports the active policy and the attempt count per
+The older `RECONCILE_*` spelling of every one of these is still honoured, and
+`CONFIGURE_*` wins where both are set. This is not cosmetic: `Environment=RECONCILE=0`
+is what holds the policy **off** in a deployed systemd unit, and ignoring the old
+name would turn the policy silently on wherever the unit file had not been
+updated alongside the code — which means unattended `AA07` writes, which open
+valves.
+
+`GET /api/v1/configure` reports the active policy and the attempt count per
 meter. A meter sitting at the cap is one that has been commanded repeatedly and
-has not complied; it is logged as `reconcile held` on every subsequent contact
+has not complied; it is logged as `configure held` on every subsequent contact
 rather than being retried forever, because these are battery devices.
 
 **`AA07` opens the valve**, so a meter whose valve is shut is skipped rather
@@ -208,47 +180,23 @@ in-place mode alongside the metering mode with no "leave unchanged" value, and
 re-asserting postpaid on a meter with no debt makes this firmware open the valve.
 Turning a customer's water back on as a side effect of a resolution change is
 the one irreversible thing this loop could do unattended, so it does not.
-`RECONCILE_ALLOW_CLOSED_VALVE=1` overrides that if you know the fleet is safe.
+`CONFIGURE_ALLOW_CLOSED_VALVE=1` overrides that if you know the fleet is safe.
 
-A command queued through the API always outranks the policy for that contact.
-
-## Where the decoder disagrees with the protocol PDF
-
-`src/lib/cjt188.js` is written against `IoT_Platform_COAP_Communication_Protocol_English.pdf`,
-but three things in that document don't hold. Each is covered by a test in
-`test/cjt188.test.js` that asserts against the document's own worked example.
-
-1. **Temperature is 3 bytes, not 2.** The §3.1 field table says 2; the worked
-   example carries `92 27 00`. At 2 bytes every field from the timestamp onward
-   decodes to garbage. The third byte is undocumented and is exposed as
-   `temperature.reserved`.
-2. **47 half-hourly slots, not 48.** The document labels the block "48
-   freeze-data", but that count includes the 00:00 cutoff pair stored separately.
-   The series itself runs 23:30 → 00:30.
-3. **§3.3's first time-calibration example has a wrong checksum** — it prints
-   `52`, the correct value is `9D`. Don't use it as a test vector. (Not exercised
-   here; this server only handles uplink.)
-
-Two further points the document leaves unstated, both handled with the
-conservative reading:
-
-- The half-hourly block has no unit byte, so it is scaled by the **cumulative
-  flow unit**. With the reference frame's `2BH` that gives ×0.001 m³, which
-  reproduces the printed table exactly.
-- §4.6 numbers the status bytes BYTE 1 / BYTE 2 but never says which is sent
-  first. Wire order is assumed. The raw pair is kept in `status.raw` — if a live
-  meter disagrees, flip the two in `readStatus()`. Note the reference frame
-  decodes to an active **empty-pipe alarm**, which the document's table leaves
-  undecoded.
+**The policy outranks a command queued through the API.** A meter whose clock or
+resolution is wrong is misreporting, and every contact spent on something else is
+another day of readings to correct later — so the meter is brought to a known
+state first. A hand-issued command is not starved by this: each rung gives up
+after `CONFIGURE_MAX_ATTEMPTS`, and the queue's next command goes out in the same
+contact once a policy command succeeds. The exception is `AA00`, which never
+replies, so a contact spent on a clock write ends there.
 
 ## Layout
 
 ```
-src/lib/cjt188.js       frame envelope + 9097 payload decoder
+src/lib/frame.js        checksum + FrameError, shared by framing and cat1
+src/lib/framing.js      splits the TCP stream into 68H…16H frames
 src/lib/cat1.js         CAT-1 frame decoding and command encoders
-src/lib/datalog.js      20-byte datalogger record decoder
-src/lib/body.js         hex / binary / JSON-hex / JSON-base64 normalisation
-src/reconcile.js        auto-reconcile policy: one report in, one command out
+src/configure.js        auto-configure policy: one report in, one command out
 src/commands.js         the downlink queue (still in memory)
 src/database/           connection lifecycle + Mongoose models  [TypeScript]
 src/database/models/    one file per collection
@@ -265,9 +213,7 @@ model per collection; `src/database/models/index.ts` re-exports the lot.
 
 ```
 meters            one document per physical meter: its latest known state
-cat1_readings     CAT-1 packet-03 reports, append-only history
-meter_readings    CJ/T 188 readings, including the 47 half-hourly slots
-datalogs          Hydrosense datalogger records
+meterreadings     one row per report, append-only history
 commands          the downlink queue
 ingest_failures   frames that would not parse, with a TTL
 counters          command ids and instruction numbers

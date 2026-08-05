@@ -1,19 +1,19 @@
 {
   "name": "water-meter-check",
   "version": "1.0.0",
-  "description": "Express ingest server for Hydrosense dataloggers and NB-IoT CJ/T 188 water meters",
+  "description": "Ingest and command server for CAT-1 NB-IoT water meters over raw TCP",
   "type": "module",
   "main": "dist/src/server.js",
   "engines": {
     "node": ">=20.0.0"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "npm run clean && tsc",
     "clean": "rm -rf dist",
     "typecheck": "tsc --noEmit",
     "start": "node dist/src/server.js",
     "dev": "tsc --watch --preserveWatchOutput & node --watch dist/src/server.js",
-    "test": "tsc && node --test dist/test/*.test.js"
+    "test": "npm run clean && tsc && node --test dist/test/*.test.js"
   },
   "dependencies": {
     "express": "^5.1.0",

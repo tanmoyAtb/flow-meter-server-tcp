@@ -1,11 +1,11 @@
 // Frames that could not be parsed, parked rather than dropped.
 //
-// /coap_push always answers 200, because an IoT platform retries on anything
-// else and a frame that fails to parse will fail identically on retry. That
-// makes silent loss the default failure mode unless the bad frame is written
-// down somewhere -- and on this project the bad frames have repeatedly been the
-// evidence: the six-byte A345 preamble, the meter's 0BH refusals, the coalesced
-// ack-plus-command segment.
+// A meter is answered on the wire whether or not its frame decoded -- an
+// unanswered report costs battery and gets retried. That makes silent loss the
+// default failure mode unless the bad frame is written down somewhere, and on
+// this project the bad frames have repeatedly been the evidence: the six-byte
+// A345 preamble, the meter's 0BH refusals, the coalesced ack-plus-command
+// segment.
 //
 // This is also the one collection an unauthenticated public port can grow
 // without bound, so it expires.
@@ -17,7 +17,7 @@ import { defineModel } from '../define-model.js';
 export const FAILURE_RETENTION_DAYS = Number(process.env.FAILURE_RETENTION_DAYS ?? 90);
 
 export interface IngestFailureDoc {
-  /** Which way in: 'coap_push', 'datalogs', or 'tcp'. */
+  /** Which way in. Only 'tcp' is produced today. */
   endpoint: string;
   reason: string;
   /** Truncated to 4 KB -- enough to identify a frame, not enough to be a disk risk. */
