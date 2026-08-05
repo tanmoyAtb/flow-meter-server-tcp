@@ -12,6 +12,3 @@ export type { CommandDoc, CommandStatus, CommandType, CommandSource } from './co
 
 export { IngestFailure, FAILURE_RETENTION_DAYS } from './ingest-failure.js';
 export type { IngestFailureDoc } from './ingest-failure.js';
-
-export { Counter, nextSequence } from './counter.js';
-export type { CounterDoc } from './counter.js';

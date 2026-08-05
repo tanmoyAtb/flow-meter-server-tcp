@@ -81,6 +81,19 @@ export function createMeterConnectionHandler(
     // meter has answered the last command.
     let openReport = null;
 
+    // The command this socket is waiting on an answer for, and the whole of how
+    // a reply is matched back to its command.
+    //
+    // The protocol offers instruction numbers for this (section I.4) and the
+    // firmware does not deliver: an error is answered with two frames, a generic
+    // one carrying instruction number 0000 and then the real one, and the
+    // generic frame has been seen arriving before any command was sent. Matching
+    // on the number credited the first frame to the wrong command and left the
+    // second unattributed. Matching on the session cannot: the meter dials in,
+    // exchanges, and powers down, so whatever is in flight on this socket is
+    // what is being answered. A reply with nothing in flight is somebody else's.
+    let inFlight = null;
+
     log.info?.(formatTcpEvent('open', { peer }));
     socket.setTimeout(IDLE_TIMEOUT_MS);
     // Keep the ack in its own segment rather than letting it wait for company.
@@ -178,8 +191,8 @@ export function createMeterConnectionHandler(
     /**
      * Ask the policy whether this report justifies a command, and queue it if
      * so. Configurer commands go through the same queue as hand-issued ones so
-     * they get an instruction number, show up in `GET /api/v1/commands`, and are
-     * completed by the reply handler like anything else.
+     * they show up in `GET /api/v1/commands` and are completed by the reply
+     * handler like anything else.
      */
     const configure = (reading) => {
       if (!configurer || !commands || !reading) return null;
@@ -233,6 +246,7 @@ export function createMeterConnectionHandler(
         }
       });
       commands.markSent(cmd);
+      inFlight = cmd;
       log.info?.(
         formatTcpEvent('command', {
           peer,
@@ -260,24 +274,38 @@ export function createMeterConnectionHandler(
       openReport = null;
     };
 
+    /**
+     * The command this reply belongs to, or null. The address check is cheap
+     * insurance: one socket serves one meter, so a reply carrying a different
+     * address is not an answer to anything sent on it.
+     */
+    const answering = (address) => (inFlight && inFlight.address === address ? inFlight : null);
+
+    const attribution = (cmd, recorded) => {
+      if (!cmd) return ' (no command in flight)';
+      return recorded ? ` (command #${cmd.id})` : ` (command #${cmd.id}, already answered)`;
+    };
+
     const handleWriteResponse = (frame, hex) => {
       const response = decodeWriteResponse(frame);
-      const cmd = commands?.findSentByInstruction(response.address, response.instructionNumber);
+      const cmd = answering(response.address);
       const outcome = response.success ? 'ok' : `error code ${response.errorCode}`;
 
-      if (cmd) {
+      // False means the command already has a verdict -- the second of the two
+      // frames an error produces. The first one is the answer; this is an echo.
+      const recorded =
+        cmd &&
         commands.complete(cmd, {
           success: response.success,
           detail: response.success ? null : `meter returned ${response.errorCode}`,
         });
-      }
 
       log.info?.(
         formatTcpEvent('command reply', {
           peer,
           detail:
             `${response.address} instr ${response.instructionNumber} -> ${outcome}` +
-            `${cmd ? ` (command #${cmd.id})` : ' (no matching command)'}` +
+            `${attribution(cmd, recorded)}` +
             `   meter clock now ${response.meterClock.iso ?? response.meterClock.raw}`,
         }),
       );
@@ -291,7 +319,7 @@ export function createMeterConnectionHandler(
      */
     const handleReadResponse = (frame, hex) => {
       const response = decodeReadResponse(frame);
-      const cmd = commands?.findSentByInstruction(response.address, response.instructionNumber);
+      const cmd = answering(response.address);
       if (cmd) commands.complete(cmd, { success: true, detail: 'parameters returned' });
       log.info?.(formatReadResponse(response, hex, { peer }));
       finishExchange(true);

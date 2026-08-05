@@ -18,9 +18,15 @@ export function createCommandQueue({ ttlMs = DEFAULT_TTL_MS, now = () => Date.no
   const byAddress = new Map(); // address -> command id[]
   let nextId = 1;
 
-  // Instruction numbers correlate a command with the meter's response: section
-  // I.4 requires they not repeat, and the reply carries the same number back.
-  let nextInstruction = 1;
+  // Section I.4 says instruction numbers must not repeat. They are not used to
+  // match a reply to its command -- this firmware does not echo them reliably,
+  // so tcp.js correlates by session instead -- but they still go on the wire,
+  // and a meter that deduplicates by number could silently drop a repeat.
+  //
+  // Seeded from the clock rather than 1 so a restart lands somewhere else in the
+  // 16-bit space instead of reissuing numbers that may still be outstanding.
+  // Zero is skipped: it is the value the meter's own refusals carry.
+  let nextInstruction = (now() >>> 4) & 0xffff || 1;
 
   const isLive = (cmd) => cmd.status === 'queued' && cmd.expiresAt > now();
 
@@ -82,29 +88,20 @@ export function createCommandQueue({ ttlMs = DEFAULT_TTL_MS, now = () => Date.no
     },
 
     /**
-     * Match a meter reply back to the command that provoked it.
+     * Record a verdict, and say whether it was the one that stuck.
      *
-     * Section I.4 says the reply carries the same instruction number, and that
-     * is the correct match. Real meters do not always honour it -- one observed
-     * rejection came back with instruction number 0000 and data identifier 0000
-     * -- so when the number matches nothing and exactly one command is
-     * outstanding for that meter, fall back to it. Without this a rejected
-     * command sticks at `sent` forever and the caller never learns it failed.
+     * A command that already finished is left alone. An error draws two reply
+     * frames from this firmware -- a generic one carrying instruction number
+     * 0000, then the real one -- and the second must not overwrite the first.
+     * A command can also fail before it is ever sent, when its frame will not
+     * build, so `queued` is a legal starting point here too.
      */
-    findSentByInstruction(address, instructionNumber) {
-      const outstanding = (byAddress.get(address) ?? [])
-        .map((id) => byId.get(id))
-        .filter((cmd) => cmd.status === 'sent');
-
-      const exact = outstanding.find((cmd) => cmd.instructionNumber === instructionNumber);
-      if (exact) return exact;
-      return outstanding.length === 1 ? outstanding[0] : null;
-    },
-
     complete(cmd, { success, detail }) {
+      if (cmd.status !== 'queued' && cmd.status !== 'sent') return false;
       cmd.status = success ? 'acknowledged' : 'failed';
       cmd.completedAt = new Date(now()).toISOString();
       cmd.result = detail ?? null;
+      return true;
     },
 
     get(id) {

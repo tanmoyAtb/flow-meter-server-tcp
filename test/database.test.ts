@@ -24,7 +24,6 @@ import {
   usageBetween,
   Command,
   IngestFailure,
-  nextSequence,
   REPORT_OWNED_FIELDS,
 } from '../src/database/index.js';
 
@@ -253,42 +252,16 @@ test('a period with nothing to anchor on returns null, not zero', async (t) => {
   assert.equal(await usageBetween(ADDRESS, new Date(Date.UTC(2026, 5, 1)), new Date(Date.UTC(2026, 5, 30))), null);
 });
 
-// --- sequences ----------------------------------------------------------
-
-test('sequences are monotonic and independent', async (t) => {
-  if (!needsMongo(t)) return;
-
-  assert.equal(await nextSequence('command_id'), 1);
-  assert.equal(await nextSequence('command_id'), 2);
-  assert.equal(await nextSequence('instruction_number'), 1, 'a separate sequence starts over');
-  assert.equal(await nextSequence('command_id'), 3);
-});
-
-test('concurrent draws never collide', async (t) => {
-  if (!needsMongo(t)) return;
-
-  // Protocol section I.4: instruction numbers must not repeat. Two meters can
-  // be mid-contact at the same moment, so this is not hypothetical.
-  const drawn = await Promise.all(Array.from({ length: 25 }, () => nextSequence('concurrent_test')));
-  assert.equal(new Set(drawn).size, 25, 'every draw was unique');
-  assert.deepEqual([...drawn].sort((a, b) => a - b), Array.from({ length: 25 }, (_, i) => i + 1));
-});
-
 // --- the command queue --------------------------------------------------
 
 test('a queued command survives as a row, with no closure in it', async (t) => {
   if (!needsMongo(t)) return;
 
-  const id = await nextSequence('command_id');
-  const instructionNumber = await nextSequence('instruction_number');
-
-  await Command.create({
-    _id: id,
+  const { _id: id } = await Command.create({
     address: ADDRESS,
     type: 'set_clock',
     source: 'configurer',
     params: { method: 'aa00', timeZone: 'Asia/Dhaka', time: null, meterTypeCode: 0x10 },
-    instructionNumber,
     status: 'queued',
     queuedAt: new Date(),
     expiresAt: new Date(Date.now() + 48 * 3600 * 1000),
@@ -308,15 +281,18 @@ test('the queue lookup returns the oldest live command for one meter', async (t)
   if (!needsMongo(t)) return;
 
   await Command.deleteMany({});
-  const base = { address: ADDRESS, type: 'valve' as const, source: 'api' as const, instructionNumber: 1, queuedAt: new Date(), expiresAt: new Date(Date.now() + 3600_000) };
+  const base = { address: ADDRESS, type: 'valve' as const, source: 'api' as const, queuedAt: new Date(), expiresAt: new Date(Date.now() + 3600_000) };
 
-  await Command.create({ ...base, _id: 10, status: 'acknowledged', params: {} });
-  await Command.create({ ...base, _id: 11, status: 'queued', params: { state: 'open' } });
-  await Command.create({ ...base, _id: 12, status: 'queued', params: { state: 'closed' } });
-  await Command.create({ ...base, _id: 13, address: '99999999999999', status: 'queued', params: {} });
+  // Created in order, so _id order is queue order: an ObjectId opens with a
+  // timestamp, and within one process a counter keeps ties in insertion order.
+  await Command.create({ ...base, status: 'acknowledged', params: {} });
+  const oldest = await Command.create({ ...base, status: 'queued', params: { state: 'open' } });
+  await Command.create({ ...base, status: 'queued', params: { state: 'closed' } });
+  await Command.create({ ...base, address: '99999999999999', status: 'queued', params: {} });
 
   const next = await Command.findOne({ address: ADDRESS, status: 'queued' }).sort({ _id: 1 }).lean();
-  assert.equal(next?._id, 11, 'oldest queued command, and only for this meter');
+  assert.equal(String(next?._id), String(oldest._id), 'oldest queued command, and only for this meter');
+  assert.deepEqual(next?.params, { state: 'open' });
 });
 
 test('an invalid command type is refused by the schema', async (t) => {
@@ -330,14 +306,13 @@ test('an invalid command type is refused by the schema', async (t) => {
   // failing silently at delivery a day later.
   const typo = { type: 'set_clok' } as unknown as { type: 'set_clock' };
 
+  const before = await Command.countDocuments({});
   await assert.rejects(
     () =>
       Command.create({
-        _id: 999,
         address: ADDRESS,
         ...typo,
         source: 'api',
-        instructionNumber: 1,
         status: 'queued',
         queuedAt: new Date(),
         expiresAt: new Date(),
@@ -346,7 +321,7 @@ test('an invalid command type is refused by the schema', async (t) => {
     /not a valid enum value/,
   );
 
-  assert.equal(await Command.findById(999), null, 'nothing was written');
+  assert.equal(await Command.countDocuments({}), before, 'nothing was written');
 });
 
 // --- failures -----------------------------------------------------------

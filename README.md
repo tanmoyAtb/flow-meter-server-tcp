@@ -216,7 +216,6 @@ meters            one document per physical meter: its latest known state
 meterreadings     one row per report, append-only history
 commands          the downlink queue
 ingest_failures   frames that would not parse, with a TTL
-counters          command ids and instruction numbers
 ```
 
 | Env var | Default | |

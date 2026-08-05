@@ -122,9 +122,7 @@ test('sending then acknowledging walks the command through its lifecycle', () =>
   // Once sent it is no longer offered up for delivery again.
   assert.equal(queue.nextFor(DEVICE_METER_ADDRESS), null);
 
-  const match = queue.findSentByInstruction(DEVICE_METER_ADDRESS, cmd.instructionNumber);
-  assert.equal(match.id, cmd.id);
-  queue.complete(match, { success: true });
+  assert.equal(queue.complete(cmd, { success: true }), true);
   assert.equal(queue.get(cmd.id).status, 'acknowledged');
 });
 
@@ -170,29 +168,36 @@ test('AC12 clock write matches the generic section 2 parameter layout', () => {
   assert.equal(16 + cmd[15] + 2, cmd.length);
 });
 
-test('a reply with a zeroed instruction number still resolves the command', () => {
-  // Observed from real hardware: the rejection echoed instruction 0000 rather
-  // than the number we sent, which used to leave the command stuck at "sent".
+test('the first verdict is the one that sticks', () => {
+  // Observed from real hardware: an error draws two reply frames, a generic one
+  // carrying instruction number 0000 and then the real one. Both reach the
+  // handler, and both name the same command now that matching is by session --
+  // so the second must not be able to overwrite what the first recorded.
   const queue = createCommandQueue();
   const cmd = enqueueClock(queue);
   queue.markSent(cmd);
 
-  const match = queue.findSentByInstruction(DEVICE_METER_ADDRESS, 0);
-  assert.equal(match.id, cmd.id);
-  queue.complete(match, { success: false, detail: 'meter returned 11' });
+  assert.equal(queue.complete(cmd, { success: false, detail: 'meter returned 11' }), true);
+  assert.equal(queue.complete(cmd, { success: true, detail: 'echo' }), false, 'the echo is refused');
+  assert.equal(queue.get(cmd.id).status, 'failed');
+  assert.equal(queue.get(cmd.id).result, 'meter returned 11');
+});
+
+test('a command that cannot be built fails without being sent', () => {
+  // The only path that completes a command still sitting at "queued".
+  const queue = createCommandQueue();
+  const cmd = enqueueClock(queue);
+  assert.equal(queue.complete(cmd, { success: false, detail: 'build_failed: nope' }), true);
   assert.equal(queue.get(cmd.id).status, 'failed');
 });
 
-test('the fallback does not guess when several commands are outstanding', () => {
-  const queue = createCommandQueue();
-  const a = enqueueClock(queue);
-  const b = enqueueClock(queue);
-  queue.markSent(a);
-  queue.markSent(b);
-  // Ambiguous: mis-attributing a failure is worse than leaving it unresolved.
-  assert.equal(queue.findSentByInstruction(DEVICE_METER_ADDRESS, 0), null);
-  // An exact instruction number still matches precisely.
-  assert.equal(queue.findSentByInstruction(DEVICE_METER_ADDRESS, b.instructionNumber).id, b.id);
+test('instruction numbers do not restart at 1 after a restart', () => {
+  // Nothing matches on these any more, but they still go on the wire and
+  // section I.4 says they must not repeat. Two queues built moments apart stand
+  // in for a process that was restarted.
+  const early = createCommandQueue({ now: () => 1_700_000_000_000 });
+  const later = createCommandQueue({ now: () => 1_700_000_600_000 });
+  assert.notEqual(enqueueClock(early).instructionNumber, enqueueClock(later).instructionNumber);
 });
 
 // --- wall clock the digits represent (the meter has no timezone) -----------

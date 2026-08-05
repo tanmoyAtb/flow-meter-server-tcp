@@ -29,6 +29,18 @@ const REFUSED_RESPONSE = Buffer.from(
   'hex',
 );
 
+/**
+ * The other frame a refusal produces, sent just before the one above: same
+ * error, but instruction number 0000 and data identifier 0000 rather than the
+ * ones we sent. Verbatim from 65.1.99.130 on 2026-08-04. This frame is why
+ * replies are matched by session and not by instruction number -- it has also
+ * been seen arriving before any command was sent on the connection.
+ */
+const GENERIC_REFUSAL = Buffer.from(
+  '6810040022082610000384000000001100000B2608041602330000000000000000FC16',
+  'hex',
+);
+
 class FakeSocket extends EventEmitter {
   constructor() {
     super();
@@ -153,6 +165,55 @@ test('no acknowledgement is sent if the meter never replies', () => {
   const socket = connect({ commands });
   socket.emit('data', CAT1_FRAME);
   assert.equal(socket.writes.filter(isAck).length, 0);
+});
+
+// --- matching a reply to its command --------------------------------------
+
+test('both frames of a refusal resolve to the one command that was sent', () => {
+  const commands = createCommandQueue();
+  const cmd = queueValve(commands);
+  const socket = connect({ commands });
+  socket.emit('data', CAT1_FRAME);
+  socket.emit('data', GENERIC_REFUSAL); // instruction number 0000
+  socket.emit('data', REFUSED_RESPONSE); // the real one, same error
+
+  assert.equal(commands.get(cmd.id).status, 'failed');
+  assert.equal(commands.get(cmd.id).result, 'meter returned 11');
+  // Matching on the instruction number used to credit the first frame to the
+  // command and then find nothing for the second. Neither frame is orphaned now.
+  assert.equal(socket.writes.length, 2, 'command out, then one power-off ack');
+});
+
+test('a reply on a connection that sent nothing is not credited to a stale command', () => {
+  // A command the meter never answered stays at "sent" forever -- AA00 clock
+  // writes never reply at all, so this is the normal case, not an edge one.
+  const commands = createCommandQueue();
+  const stale = queueValve(commands);
+  const first = connect({ commands });
+  first.emit('data', CAT1_FRAME);
+  first.destroy();
+  assert.equal(commands.get(stale.id).status, 'sent');
+
+  // A later contact opens with the generic refusal before anything is sent.
+  const second = connect({ commands });
+  second.emit('data', GENERIC_REFUSAL);
+
+  assert.equal(commands.get(stale.id).status, 'sent', 'not failed by a frame from another session');
+  assert.equal(second.writes.length, 0);
+});
+
+test('a reply carrying another meter address is not credited either', () => {
+  const commands = createCommandQueue();
+  const cmd = queueValve(commands);
+  const socket = connect({ commands });
+  socket.emit('data', CAT1_FRAME);
+
+  const other = Buffer.from(REFUSED_RESPONSE);
+  other[2] ^= 0xff; // a different address in the same envelope
+  other[other.length - 2] = other.subarray(0, other.length - 2).reduce((s, b) => (s + b) & 0xff, 0);
+  socket.emit('data', other);
+
+  assert.equal(commands.get(cmd.id).status, 'sent');
 });
 
 // --- the documented order, kept available ---------------------------------

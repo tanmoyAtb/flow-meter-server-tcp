@@ -14,8 +14,19 @@
 // described by its type, its target and a bag of parameters, and the encoder is
 // looked up by type at delivery time. That is what makes a command a row rather
 // than a closure -- see src/command-registry for the other half.
+//
+// Nor is the instruction number, which protocol section I.4 offers as the way to
+// correlate a command with its reply. On this firmware it does not do that job:
+// an error is answered with two frames, a generic one carrying instruction
+// number 0000 and then the real one, and the generic frame has been observed
+// arriving before any command was sent at all. Matching on the number credited
+// the wrong frame and left the right one unattributed -- see the 2026-08-04 log
+// on 65.1.99.130. Correlation is by session instead (src/tcp.js): the meter
+// dials in, exchanges, and powers down, so the command in flight on the socket
+// is the one being answered. The number still goes on the wire, and the frame
+// that carried it is kept in `frame` below, which is where to read it back.
 
-import { Schema } from 'mongoose';
+import { Schema, type Types } from 'mongoose';
 import { defineModel } from '../define-model.js';
 
 export const COMMAND_STATUSES = ['queued', 'sent', 'acknowledged', 'failed', 'expired'] as const;
@@ -40,8 +51,7 @@ export const COMMAND_SOURCES = ['api', 'configurer'] as const;
 export type CommandSource = (typeof COMMAND_SOURCES)[number];
 
 export interface CommandDoc {
-  /** Small integer from the `command_id` counter, not an ObjectId: it appears in the API and in logs. */
-  _id: number;
+  _id: Types.ObjectId;
   address: string;
   type: CommandType;
   source: CommandSource;
@@ -54,12 +64,6 @@ export interface CommandDoc {
    * would be set exactly as wrong as the delay.
    */
   params: Record<string, unknown>;
-
-  /**
-   * Correlates a command with the meter's reply. Protocol section I.4 requires
-   * these not repeat, which is why they come from a persistent counter.
-   */
-  instructionNumber: number;
 
   status: CommandStatus;
   queuedAt: Date;
@@ -76,13 +80,11 @@ export interface CommandDoc {
 
 const commandSchema = new Schema<CommandDoc>(
   {
-    _id: { type: Number, required: true },
     address: { type: String, required: true },
     type: { type: String, enum: COMMAND_TYPES, required: true },
     source: { type: String, enum: COMMAND_SOURCES, required: true, default: 'api' },
 
     params: { type: Schema.Types.Mixed, default: () => ({}) },
-    instructionNumber: { type: Number, required: true },
 
     status: { type: String, enum: COMMAND_STATUSES, required: true, default: 'queued' },
     queuedAt: { type: Date, required: true },
@@ -93,15 +95,15 @@ const commandSchema = new Schema<CommandDoc>(
     frame: { type: String, default: null },
     result: { type: String, default: null },
   },
-  { versionKey: false, _id: false },
+  { versionKey: false },
 );
 
 // The hot path: "is anything waiting for the meter that just called in".
-// Sorting by _id within it gives oldest-first delivery for free.
+// Sorting by _id within it gives oldest-first delivery for free -- an ObjectId
+// opens with a second-resolution timestamp, so it orders by queue time.
 commandSchema.index({ address: 1, status: 1, _id: 1 });
 
-// Matching a reply back to its command, and sweeping expiries.
-commandSchema.index({ address: 1, instructionNumber: 1 });
+// Sweeping expiries.
 commandSchema.index({ status: 1, expiresAt: 1 });
 
 export const Command = defineModel<CommandDoc>('Command', commandSchema, 'commands');
