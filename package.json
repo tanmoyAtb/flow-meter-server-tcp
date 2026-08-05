@@ -3,16 +3,25 @@
   "version": "1.0.0",
   "description": "Express ingest server for Hydrosense dataloggers and NB-IoT CJ/T 188 water meters",
   "type": "module",
-  "main": "src/server.js",
+  "main": "dist/src/server.js",
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
   "scripts": {
-    "start": "node src/server.js",
-    "dev": "node --watch src/server.js",
-    "test": "node --test test/*.test.js"
+    "build": "tsc",
+    "clean": "rm -rf dist",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/src/server.js",
+    "dev": "tsc --watch --preserveWatchOutput & node --watch dist/src/server.js",
+    "test": "tsc && node --test dist/test/*.test.js"
   },
   "dependencies": {
-    "express": "^5.1.0"
+    "express": "^5.1.0",
+    "mongoose": "^9.9.1"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.1.2",
+    "typescript": "^7.0.2"
   }
 }

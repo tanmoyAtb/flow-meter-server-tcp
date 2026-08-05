@@ -4,6 +4,7 @@ import { createApp } from './app.js';
 import { openStore } from './store/memory.js';
 import { createCommandQueue } from './commands.js';
 import { createMeterConnectionHandler } from './tcp.js';
+import { createReconciler, reconcileOptionsFromEnv } from './reconcile.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST ?? '0.0.0.0';
@@ -12,12 +13,18 @@ const HOST = process.env.HOST ?? '0.0.0.0';
 // write to physical hardware, so leaving them open is a deliberate choice.
 const API_TOKEN = process.env.API_TOKEN ?? null;
 
+// Bring every meter that reports in to the configured clock and resolution,
+// one command per contact. RECONCILE=0 turns it off and leaves the server a
+// pure collector that only sends what the API queued.
+const { enabled: reconcileEnabled, ...reconcileOptions } = reconcileOptionsFromEnv();
+const reconciler = reconcileEnabled ? createReconciler(reconcileOptions) : null;
+
 // Mock store: everything lives in memory and is lost on restart.
 const store = openStore();
 const commands = createCommandQueue();
-const app = createApp(store, console, { commands, apiToken: API_TOKEN });
+const app = createApp(store, console, { commands, apiToken: API_TOKEN, reconciler });
 const httpServer = http.createServer(app);
-const handleMeterConnection = createMeterConnectionHandler(store, console, { commands });
+const handleMeterConnection = createMeterConnectionHandler(store, console, { commands, reconciler });
 
 // Meters cannot be pointed at a second port -- they are provisioned with one
 // address and push raw CJ/T 188 down it. Rather than split the protocols across
@@ -66,6 +73,14 @@ server.listen(PORT, HOST, () => {
   console.log('  GET  /api/v1/commands             queued / sent / acknowledged commands');
   console.log('  GET  /debug/store                 everything ingested so far');
   console.log(`command API auth: ${API_TOKEN ? 'x-api-token required' : 'OPEN (set API_TOKEN to require a token)'}`);
+  console.log(
+    reconciler
+      ? `auto-reconcile: ON -- clock to ${reconciler.config.timeZone}, resolution to ` +
+          `${reconciler.config.resolutionLitres} L, one command per contact, ` +
+          `${reconciler.config.maxAttempts} attempts each` +
+          `${reconciler.config.allowClosedValve ? '  (WILL write AA07 to closed valves, which opens them)' : ''}`
+      : 'auto-reconcile: OFF (RECONCILE=0)',
+  );
   console.log('storage is in-memory only -- nothing is persisted');
 });
 

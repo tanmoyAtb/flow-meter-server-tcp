@@ -122,8 +122,9 @@ high byte first.**
 C0   A8   01   64   27 66
 ```
 
-Meters arrive pre-pointed at a server. Set this at commissioning time; do not plan
-on changing it remotely once a meter is in the field.
+Meters arrive pre-pointed at a server, normally set at commissioning. **It can also
+be changed remotely, over the air, and has been** — but not by writing those
+parameters, which this firmware refuses. Use the `AA17H` command in §12.
 
 ### Source addresses vary
 
@@ -429,6 +430,13 @@ never by the absence of a reply.
 | Valve open / close | `AA05` | `0CH` | 30 bytes | §11 |
 | Metering resolution | `AA07` | `18H` | 42 bytes | §9 |
 | Clock | `AA00` | `11H` | 35 bytes | §10 |
+| Server address / port | `AA17` | `14H` | 38 bytes | §12 |
+
+Every command that works on this firmware is an **`AA`-series identifier from section
+2 of the protocol**. The generic parameter writes of section III — `AC0E`, `AC0F`,
+`AC12` — are all refused with `0BH`, whatever they address. If you are looking for a
+capability, look for its `AA` command; do not conclude it is absent because the
+parameter write fails.
 
 ---
 
@@ -598,7 +606,170 @@ produces these byte for byte, the frame is correct.
   Ignore it and read the status word in the next report — that is the authoritative
   valve state.
 
-## 12. Implementation checklist
+## 12. Command: change the server address and port
+
+Data identifier **`AA17H`**, protocol section 2.12 *服务器地址端口修改*.
+
+This moves a meter from one server to another over the air. It is the most consequential
+command in this document: get it right and you can migrate a fleet without touching the
+hardware; get it wrong and the meter is gone for good.
+
+### Why not the parameter write
+
+The obvious approach — writing parameter `0xAC0E` with the 6-byte endpoint from §3 —
+**does not work on this firmware.** It comes back `0BH` with the instruction number and
+identifier echoed intact, exactly like any other section III parameter write. The frame
+is fine; the identifier is the problem.
+
+`AA17H` carries the same payload as a section 2 command, and is accepted. This was
+confirmed as a clean A/B: `AC0E` refused `0BH`, then `AA17H` accepted `00H` minutes
+later, same endpoint, same meter.
+
+> `AA17H` may be missing from your copy of the protocol PDF. Revisions exist whose
+> section 2 ends at 2.10, and this command is 2.12. If a capability seems absent, get
+> the current revision from the vendor before designing around its absence.
+
+### Frame layout — 38 bytes, `m = 14H` (20)
+
+| Offset | Len | Field | Value |
+|---|---|---|---|
+| 0–14 | 15 | Standard header, control `04H` | |
+| 15 | 1 | Data length | **`14H`** (20 decimal) |
+| 16–17 | 2 | Data identifier | `AA17` |
+| 18–19 | 2 | Modification enable | **`A6B6`** — anything else leaves the endpoint alone |
+| 20–21 | 2 | **Confirmation word** | low two bytes of the meter address XOR `A6B6` |
+| 22–25 | 4 | New IPv4 address | high byte first |
+| 26–27 | 2 | New port | high byte first |
+| 28–35 | 8 | Spare | zeros |
+| 36 | 1 | Checksum | |
+| 37 | 1 | End | `16H` |
+
+The confirmation word is a safety interlock. The meter only accepts the frame if the
+word matches the address it knows itself by, so a broadcast or a mistyped address
+cannot re-point a fleet by accident.
+
+**Compute it in value order**, not wire order: take the address's two least significant
+BCD bytes as they read, high byte first, and XOR with `A6B6`.
+
+```
+address        00102608220004
+BCD pairs      00 10 26 08 22 00 04
+low two bytes  00 04            ← value order, NOT the wire order 04 00
+confirm        0x0004 ^ 0xA6B6 = 0xA6B2
+```
+
+The specification sentence — 表地址低两字节分别与A6B6异或 — does not settle the byte
+order, and the two readings sum identically, so **no checksum can tell them apart.**
+A meter with the opposite convention would refuse `0BH` while everything else about
+the frame is correct. If that happens, flip to wire order (`0xA2B6` for this address)
+before you go looking for a deeper problem.
+
+### Worked example — move to 65.2.232.159:8505
+
+```
+68100400220826100003040002000014AA17A6B6A6B24102E89F213900000000000000009216
+                              ^^ m = 14H
+                                ^^^^ AA17
+                                    ^^^^ A6B6 enable
+                                        ^^^^ A6B2 confirm (address 00102608220004)
+                                            ^^^^^^^^ 41 02 E8 9F = 65.2.232.159
+                                                    ^^^^ 2139 = 8505
+```
+
+Reply, 35 bytes, the standard `84H` form from §7:
+
+```
+68100400220826100003840002000011AA17 00 2608051922310000000000000000D616
+                                     ^^ success
+```
+
+### What to expect
+
+**1. The move happens after the current session, not during it.** The report that
+carried the command still completes on the old server — ack and all. The meter switches
+for its *next* contact.
+
+```mermaid
+sequenceDiagram
+    participant M as Meter
+    participant O as Old server
+    participant N as New server
+    M->>O: report #70 (97H)
+    O->>M: AA17 command (04H)
+    M->>O: reply (84H) success=00
+    O->>M: ack (17H) AFH
+    Note over M: endpoint now updated
+    M->>N: report #71 (97H)
+    N->>M: ack (17H) AFH
+```
+
+Observed exactly this way: report #70 on the old server, report #71 on the new one,
+counters continuous, same IMEI and ICCID, cumulative usage unchanged. **So a meter's
+command-carrying contact always lands on the old server, and you only learn the move
+succeeded one contact later.** Build your migration tracking around that.
+
+**2. There is no readback.** The `01H` read is refused on this firmware, so you cannot
+ask a meter which server it currently points at. The only confirmation is that it turns
+up. Record the intended endpoint yourself, at the moment you queue the command.
+
+**3. Success `00H` means the frame was accepted, not that the meter has moved.** It is
+necessary, not sufficient. A no-op write — sending the address the meter already has —
+returns exactly the same `00H`.
+
+**4. `0BH` is safe.** A refusal leaves the meter where it was. Nothing is lost and you
+can try again with a different confirmation byte order.
+
+### ⚠️ The failure mode: permanent loss
+
+**Downlink rides on the acknowledgement path.** The meter is a TCP client (§1) — the
+only moment you can send it anything is while it is connected, having just reported.
+A meter pointed at a server that never acknowledges reports can never be commanded
+again, including to send it back.
+
+There is no remote recovery. No timeout, no fallback to the secondary address, no
+factory reset over the air. Someone visits the meter with a cable.
+
+So, before you point a single meter at an endpoint:
+
+- [ ] The destination is listening on **raw TCP** at that exact IP and port
+- [ ] It answers a real report with a byte-correct `17H` ack (§6) — replay a captured
+      frame and compare the response byte for byte, do not assume
+- [ ] It answers frames it *cannot* decode, rather than dropping them
+- [ ] Its firewall and security group admit the meter's carrier IP range, not just yours
+- [ ] It stays up. A destination that is merely correct when tested is not enough
+
+"It accepted a TCP connection" is not evidence. A server that accepts the socket and
+never acks will swallow the meter just as completely as one that is switched off.
+
+> Verify the whole path on **one** meter and confirm it reports before migrating the
+> rest. A scripted fleet migration to a bad endpoint loses the entire fleet in one pass,
+> and every meter fails identically and silently.
+
+### Migrating between two servers you control
+
+The safe shape, and the one that was actually used:
+
+1. Stand the new server up and prove the ack (checklist above).
+2. Turn **off** any auto-reconcile policy on the new server. A fresh server has no
+   history for a meter that arrives, so its policy fires on the very first contact —
+   and on this firmware that could mean `AA07`, which opens the valve (§9). Let the
+   meter arrive, be acknowledged, and nothing else.
+3. Queue the `AA17` on the **old** server. That is where the meter still reports.
+   If that server runs an auto-reconcile policy that outranks hand-issued
+   commands, check it has no outstanding work for this meter first — otherwise
+   the `AA17` waits behind it, and a clock write in particular consumes the whole
+   contact because `AA00` never replies (§10).
+4. Force a contact (button press) and confirm `84H` success `00H`.
+5. Force a second contact and confirm the report arrives on the new server.
+6. Only then re-enable policy on the new server.
+
+Keeping both endpoints under your control matters: if the meter lands on the new server,
+you can send it home the same way. Re-pointing to a third party's server is a one-way
+door unless you have watched their ack with your own packet capture.
+
+---
+
+## 13. Implementation checklist
 
 **Ingest**
 
@@ -630,13 +801,18 @@ produces these byte for byte, the frame is correct.
 
 **Operational**
 
-- [ ] Authenticate the command API. It opens valves.
+- [ ] Authenticate the command API. It opens valves, and it re-points meters — one
+      unauthenticated POST can put a meter permanently out of reach (§12)
 - [ ] Persist the queue and readings if they must survive a restart
 - [ ] Record which time zone a meter's clock is set to; before it is set, it is UTC+8
+- [ ] Record the endpoint you last sent each meter, at queue time — the meter cannot
+      be asked where it points
+- [ ] Prove any new destination acks a real report before re-pointing anything at it
+- [ ] Migrate one meter and wait for it to arrive before migrating the rest
 
 ---
 
-## 13. Reference frames
+## 14. Reference frames
 
 Meter address `00102608220004`, instruction number `0001`.
 
@@ -659,6 +835,19 @@ precision 10 L     68100400220826100003040001000018AA0760484B0000000000
 clock (out)        68100400220826100003040001000011AA005A26080415340600
                    000000000000007A16
 
+server → 65.1.99.130:8505       (instr 0001)
+                   68100400220826100003040001000014AA17A6B6A6B241016382
+                   21390000000000000000EE16
+server → 65.2.232.159:8505      (instr 0002)
+                   68100400220826100003040002000014AA17A6B6A6B24102E89F
+                   213900000000000000009216
+AA17 reply (in)    68100400220826100003840002000011AA17002608051922310000000000000000D616
+
 success reply (in) 68100400220826100003840001000011AA05002608041626380000000000000000CA16
 error reply (in)   68100400220826100003840003000011A9010B26080416545900000000000000002116
 ```
+
+Both `AA17` frames carry the same confirmation word `A6B2`, because that is derived from
+the meter address and does not change with the endpoint. Only the four IP bytes, the
+instruction number and the checksum differ between them — a useful pair for testing an
+encoder, since a byte-order bug in the IP field shows up immediately as a mismatch.

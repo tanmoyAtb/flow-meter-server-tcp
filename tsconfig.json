@@ -1,0 +1,40 @@
+{
+  "compilerOptions": {
+    // Node 22 on both the dev machine and the EC2 box.
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+
+    // Sources compile to dist/src, tests to dist/test, so relative imports
+    // between them survive the move.
+    "rootDir": ".",
+    "outDir": "dist",
+    "sourceMap": true,
+
+    // The existing JavaScript is compiled but not type-checked. This is what
+    // lets TypeScript arrive without a 30-file rewrite: .js keeps working
+    // exactly as it does today, new code is .ts and fully checked, and files
+    // convert one at a time. Turn checkJs on once the last .js is gone.
+    "allowJs": true,
+    "checkJs": false,
+
+    "strict": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "forceConsistentCasingInFileNames": true,
+
+    // Imports must say what they are, and type-only imports must be erasable.
+    // Both matter here: the output is ESM run directly by Node, so a stray
+    // type import that survives erasure becomes a runtime require of a module
+    // that has no runtime.
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+
+    "resolveJsonModule": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*", "test/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

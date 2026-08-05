@@ -11,11 +11,17 @@ import {
   encodeSetClock,
   encodeSetClockParam,
   encodeSetMeterType,
+  encodeSetServerAddress,
+  encodeSetServerEndpoint,
   encodeValveOperation,
   METERING_MODE_BYTES,
   PAYMENT_MODE_BYTES,
   IN_PLACE_MODE_BYTES,
+  SERVER_ADDRESS_PRIMARY,
+  SERVER_ADDRESS_SECONDARY,
 } from '../lib/cat1.js';
+
+const SERVER_ADDRESS_IDENTIFIERS = { primary: SERVER_ADDRESS_PRIMARY, secondary: SERVER_ADDRESS_SECONDARY };
 
 const ADDRESS_RE = /^\d{14}$/; // 14-digit BCD meter address
 
@@ -244,6 +250,105 @@ export function commandRouter(queue, log = console, { token = null } = {}) {
       status: 'queued',
       command: queue.get(cmd.id),
       note: "delivered at the meter's next contact; confirm via the table type code in the following report",
+    });
+  });
+
+  // Re-points the meter at a different ingest server. Every other command here
+  // can be undone by sending its opposite; this one cannot. A meter that is
+  // pointed at a server which does not acknowledge its reports never opens a
+  // downlink window again, and the only recovery is physical access.
+  //
+  // So: `confirm: true` is required, and `ip`/`port` are never defaulted.
+  //
+  // `method` picks the frame. AA17H (section 2.12) is the vendor-confirmed one
+  // and the default; the parameter write is kept only because meters older than
+  // that section may be the other way round. A real meter refused the parameter
+  // write with 0BH on 2026-08-05, so do not reach for it without a reason.
+  router.post('/meters/:address/server-address', (req, res) => {
+    const { address } = req.params;
+    if (!ADDRESS_RE.test(address)) {
+      return res.status(400).json({ ok: false, reason: 'bad_address', detail: 'expected 14 decimal digits' });
+    }
+
+    const method = req.body?.method ?? 'command';
+    if (method !== 'command' && method !== 'parameter') {
+      return res.status(400).json({
+        ok: false,
+        reason: 'bad_method',
+        detail: "method must be 'command' (AA17H, section 2.12) or 'parameter' (AC0E/AC0F, refused on this firmware)",
+      });
+    }
+
+    const which = req.body?.which ?? 'primary';
+    const identifier = SERVER_ADDRESS_IDENTIFIERS[which];
+    if (identifier === undefined) {
+      return res.status(400).json({
+        ok: false,
+        reason: 'bad_which',
+        detail: `which must be one of ${Object.keys(SERVER_ADDRESS_IDENTIFIERS).join(', ')}`,
+      });
+    }
+    if (method === 'command' && which !== 'primary') {
+      // AA17H writes one endpoint and has no slot selector.
+      return res.status(400).json({
+        ok: false,
+        reason: 'bad_which',
+        detail: "AA17H has no secondary slot; use method: 'parameter' to address AC0F",
+      });
+    }
+
+    if (req.body?.confirm !== true) {
+      return res.status(400).json({
+        ok: false,
+        reason: 'confirmation_required',
+        detail: 'send confirm: true -- a wrong address here loses the meter permanently',
+      });
+    }
+
+    const { ip, port, wireOrderConfirmation = false } = req.body ?? {};
+    const meterTypeCode = req.body?.meterTypeCode ?? 0x10;
+    const encode = (instructionNumber) =>
+      method === 'command'
+        ? encodeSetServerEndpoint({ meterTypeCode, address }, { ip, port, wireOrderConfirmation }, instructionNumber)
+        : encodeSetServerAddress({ meterTypeCode, address }, { ip, port, identifier }, instructionNumber);
+
+    try {
+      // Built once here purely to validate; the queue rebuilds it at delivery
+      // with the real instruction number.
+      encode(1);
+    } catch (err) {
+      return res.status(400).json({ ok: false, reason: err.code ?? 'bad_server_address', detail: err.message });
+    }
+
+    const params = {
+      method,
+      ip,
+      port,
+      sentTime: null,
+      meterTypeCode,
+      ...(method === 'command'
+        ? { identifier: 'AA17', wireOrderConfirmation }
+        : { which, identifier: identifier.toString(16).toUpperCase() }),
+    };
+
+    const cmd = queue.enqueue(address, {
+      type: 'set_server_address',
+      params,
+      build: (instructionNumber) => {
+        params.sentTime = new Date().toISOString();
+        return encode(instructionNumber);
+      },
+    });
+
+    log.warn?.(`command queued: set_server_address #${cmd.id} for ${address} -> ${ip}:${port} via ${method}`);
+
+    return res.status(202).json({
+      ok: true,
+      status: 'queued',
+      command: queue.get(cmd.id),
+      note:
+        "delivered at the meter's next contact; if the meter reports to the new address it will only be" +
+        ' reachable there, so confirm the new server acknowledges reports before sending this',
     });
   });
 

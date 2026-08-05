@@ -321,7 +321,14 @@ const toBcd = (n) => ((Math.floor(n / 10) % 10) << 4) | (n % 10);
  * fixed offset means a region that starts observing DST keeps working (Dhaka is
  * UTC+6 today, but did run DST in 2009).
  */
-function clockParts(when, timeZone) {
+/**
+ * The wall-clock digits a meter should be showing: `[yy, mm, dd, hh, mi, ss]`.
+ *
+ * Exported because the reconciler compares a meter's reported clock against the
+ * same digits this produces. Two implementations of "what time is it in Dhaka"
+ * would eventually disagree, and the disagreement would look like clock drift.
+ */
+export function clockParts(when, timeZone) {
   if (!timeZone) {
     return [
       when.getUTCFullYear() % 100,
@@ -415,12 +422,11 @@ export function encodeSetClock({ meterTypeCode = 0x10, address }, when, instruct
  *   68 | T | A6-A0 | 01 | 04 | instruction no. | 0000 | 08H | AC12 |
  *   YY MM DD HH MM SS | CS | 16                          -- 26 bytes, m = 8
  *
- * An alternative to the AA00H form: a real meter rejected AA00H with error 0BH
- * and echoed back a zeroed instruction number and data identifier, which is
- * what a device does when it does not accept the identifier at all. Section
- * 2.1's heading calls that flow the "power-off procedure", so its clock write
- * may only be valid inside that sequence. This form uses the documented
- * read/write parameter instead.
+ * Superseded by encodeSetClock: AA00H works, provided it is sent alone and
+ * first in a session, and it applies silently with no 84H reply at all. This
+ * form is the one that fails -- a real meter refused 0xAC12 with error 0BH,
+ * exactly as it later refused 0xAC0E, so generic parameter writes look
+ * unimplemented on this firmware. Kept for meters that do implement them.
  */
 export function encodeSetClockParam({ meterTypeCode = 0x10, address }, when, instructionNumber, { timeZone = null } = {}) {
   const cmd = commandFrame({ meterTypeCode, address }, WRITE_CONTROL, 0xac12, instructionNumber, 0x08);
@@ -524,6 +530,153 @@ export function encodeSetMeterType(
   cmd[18] = meteringMode;
   cmd[19] = paymentMode;
   cmd[20] = inPlaceMode;
+  return sealCommand(cmd);
+}
+
+// --- where the meter reports to (protocol section III, 0xAC0E / 0xAC0F) ----
+
+export const SERVER_ADDRESS_PRIMARY = 0xac0e;
+export const SERVER_ADDRESS_SECONDARY = 0xac0f;
+
+/** m = 2 identifier bytes + 6 parameter bytes; section 2's generic write. */
+export const SERVER_ADDRESS_DATA_LENGTH = 0x08;
+
+/**
+ * Re-point the meter at a different server (section 2 "server write table
+ * parameters", carrying parameter 0xAC0E or 0xAC0F).
+ *
+ *   68 | T | A6-A0 | 03 | 04 | instruction no. | 0000 | 08H | AC0E |
+ *   IP(4) | port(2) | CS | 16                            -- 26 bytes, m = 8
+ *
+ * Section III lists both server addresses as R/W, 6 bytes, "4-byte address +
+ * 2-byte port number, high byte listed first", and the revision of the protocol
+ * PDF in this repo has no AA-series command for it -- its section 2 command
+ * list ends at 2.10 -- so this looked like the only route.
+ *
+ * It is not, and it does not work. Writing 0xAC0E with the address the meter
+ * already had -- a no-op probe -- came back with error 0BH on 2026-08-05, the
+ * instruction number and identifier echoed back intact, which is a meter that
+ * parsed the frame and refused the identifier. 0xAC12 fails the same way:
+ * generic parameter writes are not implemented on this firmware.
+ *
+ * Use `encodeSetServerEndpoint` instead. A newer revision of the vendor's
+ * document adds section 2.12 with a dedicated AA17H command, which is the
+ * AA-series shape this firmware does accept. This one is kept only for meters
+ * that predate it.
+ */
+export function encodeSetServerAddress(
+  { meterTypeCode = 0x10, address },
+  { ip, port, identifier = SERVER_ADDRESS_PRIMARY },
+  instructionNumber,
+) {
+  const octets = String(ip).split('.').map(Number);
+  if (octets.length !== 4 || octets.some((o) => !Number.isInteger(o) || o < 0 || o > 255)) {
+    throw new FrameError('bad_ip', `expected dotted-quad IPv4, got ${JSON.stringify(ip)}`);
+  }
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new FrameError('bad_port', `expected a port in 1-65535, got ${JSON.stringify(port)}`);
+  }
+
+  const cmd = commandFrame(
+    { meterTypeCode, address },
+    WRITE_CONTROL,
+    identifier,
+    instructionNumber,
+    SERVER_ADDRESS_DATA_LENGTH,
+  );
+  octets.forEach((o, i) => {
+    cmd[18 + i] = o;
+  });
+  cmd.writeUInt16BE(port, 22); // high byte first, as section 5 spells out
+  return sealCommand(cmd);
+}
+
+// --- re-pointing the meter, the way that works (section 2.12, AA17H) -------
+
+export const SERVER_ENDPOINT_IDENTIFIER = 0xaa17;
+
+/** Byte 15 is "20" in the table, and 20 decimal is what the byte positions say:
+ *  data runs 16-35, CS at 36, end frame at 37, so the frame is 38 bytes and
+ *  m = 16 + 20 + 2 = 38. Read as 0x20 the arithmetic gives a 50-byte frame that
+ *  contradicts the table's own offsets. Where the two disagree this firmware has
+ *  consistently followed the byte positions -- see the AA07 note above. */
+export const SERVER_ENDPOINT_DATA_LENGTH = 20;
+
+/** Section 2.12 calls 0xA6B6 the "modification enable". Nothing happens without it. */
+export const SERVER_ENDPOINT_ENABLE = 0xa6b6;
+
+/**
+ * The confirmation word: the low two bytes of the meter address, XORed with
+ * 0xA6B6. A meter only accepts the frame if this matches the address it knows
+ * itself by, so a broadcast or a mistyped address cannot re-point a fleet.
+ *
+ * "表地址低两字节分别与A6B6异或" is the whole of the specification and it leaves the
+ * byte order open, so this was a coin flip until a meter settled it. **Value
+ * order is correct**: the address's two least significant BCD bytes read high
+ * byte first -- for 00102608220004 that is 00 04, giving 0x0004 ^ 0xA6B6 =
+ * 0xA6B2 -- accepted with success 00H on 2026-08-05. That matches every other
+ * multi-byte data field in this document being high byte first.
+ *
+ * `wireOrder` produces the losing reading (04 00 -> 0xA2B6). Kept only because
+ * the two orderings sum identically, so a checksum cannot tell them apart and a
+ * meter with the opposite convention would be indistinguishable from a bad
+ * frame. Try it if some other meter refuses AA17H with everything else right.
+ */
+export function serverEndpointConfirmation(address, { wireOrder = false } = {}) {
+  const low = addressBytes(address).subarray(0, 2); // wire order: least significant first
+  const pair = wireOrder ? low : Buffer.from([low[1], low[0]]);
+  return ((pair[0] ^ 0xa6) << 8) | (pair[1] ^ 0xb6);
+}
+
+/**
+ * Re-point the meter at a different server (section 2.12, identifier AA17H).
+ *
+ *   68 | T | A6-A0 | 03 | 04 | instruction no. | 0000 | 14H | AA17 |
+ *   A6B6 | confirm(2) | IP(4) | port(2) | spare(8) | CS | 16   -- 38 bytes, m = 20
+ *
+ * **Confirmed against hardware 2026-08-05**: accepted with success 00H, where
+ * the 0xAC0E parameter write of the same endpoint was refused 0BH minutes
+ * earlier. This firmware implements section 2.x command identifiers and refuses
+ * section III parameter ones, and this is the section 2.x form. Sent as a no-op
+ * -- writing the address the meter already had -- so acceptance is proof the
+ * frame parses, not that the endpoint moved.
+ *
+ * It is absent from the protocol PDF in this repo -- that revision's section 2
+ * ends at 2.10 -- so the layout here comes from a chart the vendor supplied.
+ *
+ * **This is the only command that can put a meter permanently out of reach.**
+ * Downlink rides on the acknowledgement path, so a meter pointed at a server
+ * that does not acknowledge its reports can never be commanded again, including
+ * to point it back. Verify the destination actually acknowledges before sending
+ * this to anything, and do it to one meter first.
+ */
+export function encodeSetServerEndpoint(
+  { meterTypeCode = 0x10, address },
+  { ip, port, wireOrderConfirmation = false },
+  instructionNumber,
+) {
+  const octets = String(ip).split('.').map(Number);
+  if (octets.length !== 4 || octets.some((o) => !Number.isInteger(o) || o < 0 || o > 255)) {
+    throw new FrameError('bad_ip', `expected dotted-quad IPv4, got ${JSON.stringify(ip)}`);
+  }
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new FrameError('bad_port', `expected a port in 1-65535, got ${JSON.stringify(port)}`);
+  }
+
+  const cmd = commandFrame(
+    { meterTypeCode, address },
+    WRITE_CONTROL,
+    SERVER_ENDPOINT_IDENTIFIER,
+    instructionNumber,
+    SERVER_ENDPOINT_DATA_LENGTH,
+  );
+  cmd.writeUInt16BE(SERVER_ENDPOINT_ENABLE, 18);
+  cmd.writeUInt16BE(serverEndpointConfirmation(address, { wireOrder: wireOrderConfirmation }), 20);
+  octets.forEach((o, i) => {
+    cmd[22 + i] = o;
+  });
+  cmd.writeUInt16BE(port, 26);
+  // Bytes 28-35 are spare and left zero.
   return sealCommand(cmd);
 }
 

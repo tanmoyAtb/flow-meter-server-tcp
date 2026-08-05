@@ -3,7 +3,7 @@ import { datalogRouter } from './routes/datalogs.js';
 import { coapRouter } from './routes/coap.js';
 import { commandRouter } from './routes/commands.js';
 
-export function createApp(store, log = console, { commands = null, apiToken = null } = {}) {
+export function createApp(store, log = console, { commands = null, apiToken = null, reconciler = null } = {}) {
   const app = express();
   app.disable('x-powered-by');
 
@@ -16,6 +16,14 @@ export function createApp(store, log = console, { commands = null, apiToken = nu
   // Inspection for the mock store: without a database there is nowhere else to
   // look at what was ingested. Unauthenticated -- remove this before the server
   // is fronted by a real store or exposed to anything but a test network.
+  // What the policy is set to and which meters it has given up on. The attempt
+  // counts are the interesting half: a meter listed at the attempt cap is one
+  // that has been commanded repeatedly and has not complied.
+  app.get('/api/v1/reconcile', (req, res) => {
+    if (!reconciler) return res.json({ ok: true, enabled: false });
+    res.json({ ok: true, enabled: true, config: reconciler.config, attempts: reconciler.state() });
+  });
+
   app.get('/debug/store', (req, res) => res.json(store.snapshot()));
   app.delete('/debug/store', (req, res) => {
     store.reset();

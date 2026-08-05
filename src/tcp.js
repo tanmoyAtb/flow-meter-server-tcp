@@ -65,7 +65,12 @@ const ACK_BEFORE_COMMAND = process.env.ACK_BEFORE_COMMAND === '1';
 export function createMeterConnectionHandler(
   store,
   log = console,
-  { commands = null, commandDelayMs = COMMAND_DELAY_MS, ackBeforeCommand = ACK_BEFORE_COMMAND } = {},
+  {
+    commands = null,
+    reconciler = null,
+    commandDelayMs = COMMAND_DELAY_MS,
+    ackBeforeCommand = ACK_BEFORE_COMMAND,
+  } = {},
 ) {
   return function handleConnection(socket) {
     const peer = `${socket.remoteAddress}:${socket.remotePort}`;
@@ -114,12 +119,34 @@ export function createMeterConnectionHandler(
         throw new FrameError('unexpected_control', `control ${envelope.controlName} is not handled here`);
       }
 
-      // The queue has to be consulted before anything is written back, because
-      // what we send depends on whether a command is waiting.
-      const pending = commands?.nextFor(envelope.address) ?? null;
+      // The payload is decoded before anything is written back, because the
+      // reconciler decides what to send from the clock and table type code
+      // inside it. A packet we cannot read must still be answered -- otherwise
+      // an unsupported report costs battery -- so a decode failure is held and
+      // rethrown once the meter has been dealt with.
+      let reading = null;
+      let decodeError = null;
+      try {
+        reading = { ...envelope, payload: decodePayload(envelope, frame) };
+      } catch (err) {
+        if (!(err instanceof FrameError)) throw err;
+        decodeError = err;
+      }
 
-      // Answer before decoding the payload: a packet type we cannot read must
-      // still be answered, or an unsupported report costs battery.
+      // The policy outranks an explicitly queued command.
+      //
+      // A meter whose clock or resolution is wrong is misreporting, and every
+      // contact spent on something else is another day of readings that have to
+      // be corrected later. So bring the meter to a known-good state first, then
+      // do what was asked of it.
+      //
+      // A hand-issued command is not starved by this. The policy runs out of
+      // work -- each rung gives up after `maxAttempts` and stops claiming -- and
+      // `finishExchange` sends the queue's next command in the same contact once
+      // a policy command succeeds. The exception is `AA00`, which never replies,
+      // so a contact spent on a clock write ends there.
+      const pending = reconcile(reading) ?? commands?.nextFor(envelope.address) ?? null;
+
       if (!pending) {
         sendAck(envelope, { powerOff: true });
       } else if (ackBeforeCommand) {
@@ -132,9 +159,29 @@ export function createMeterConnectionHandler(
         sendCommand(pending, envelope);
       }
 
-      const reading = { ...envelope, payload: decodePayload(envelope, frame) };
+      if (decodeError) throw decodeError;
+
       const { duplicate } = store.saveCat1Reading(reading, hex);
       log.info?.(formatCat1Reading(reading, hex, { duplicate, source: 'tcp' }));
+    };
+
+    /**
+     * Ask the policy whether this report justifies a command, and queue it if
+     * so. Reconciler commands go through the same queue as hand-issued ones so
+     * they get an instruction number, show up in `GET /api/v1/commands`, and are
+     * completed by the reply handler like anything else.
+     */
+    const reconcile = (reading) => {
+      if (!reconciler || !commands || !reading) return null;
+      const { command, notes } = reconciler.decide(reading);
+      for (const note of notes) {
+        log.warn?.(formatTcpEvent('reconcile held', { peer, detail: `${reading.address} ${note}` }));
+      }
+      if (!command) return null;
+      log.info?.(
+        formatTcpEvent('reconcile', { peer, detail: `${reading.address} -> ${command.type}: ${command.reason}` }),
+      );
+      return commands.enqueue(reading.address, command);
     };
 
     const sendAck = (envelope, { powerOff }) => {
