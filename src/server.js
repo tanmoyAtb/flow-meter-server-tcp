@@ -5,6 +5,7 @@ import { openStore } from './store/memory.js';
 import { createCommandQueue } from './commands.js';
 import { createMeterConnectionHandler } from './tcp.js';
 import { createConfigurer, configureOptionsFromEnv } from './configure.js';
+import { timestampedLog } from './lib/log.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST ?? '0.0.0.0';
@@ -19,12 +20,18 @@ const API_TOKEN = process.env.API_TOKEN ?? null;
 const { enabled: configureEnabled, ...configureOptions } = configureOptionsFromEnv();
 const configurer = configureEnabled ? createConfigurer(configureOptions) : null;
 
+// Everything printed is stamped with the instant it was printed. The store is
+// in memory and the database is not wired up yet, so this log is the record of
+// what the fleet has done -- and a record of readings with no arrival time in
+// it can only be half-loaded into a database later. See src/lib/log.js.
+const log = timestampedLog(console);
+
 // Mock store: everything lives in memory and is lost on restart.
 const store = openStore();
 const commands = createCommandQueue();
-const app = createApp(store, console, { commands, apiToken: API_TOKEN, configurer });
+const app = createApp(store, log, { commands, apiToken: API_TOKEN, configurer });
 const httpServer = http.createServer(app);
-const handleMeterConnection = createMeterConnectionHandler(store, console, { commands, configurer });
+const handleMeterConnection = createMeterConnectionHandler(store, log, { commands, configurer });
 
 // Meters cannot be pointed at a second port -- they are provisioned with one
 // address and push raw frames down it. Rather than split raw TCP and HTTP across
@@ -65,7 +72,9 @@ const server = net.createServer((socket) => {
 });
 
 server.listen(PORT, HOST, () => {
-  console.log(`ingest server listening on ${HOST}:${PORT}  (raw TCP + HTTP share this port)`);
+  // Stamped, unlike the static lines under it: this is the marker that says
+  // when the process came up, which brackets every restart in the log.
+  log.info(`ingest server listening on ${HOST}:${PORT}  (raw TCP + HTTP share this port)`);
   console.log('  raw TCP   CAT-1 meters pushing frames straight down the socket');
   console.log('  POST /api/v1/meters/:address/time queue a clock calibration');
   console.log('  GET  /api/v1/commands             queued / sent / acknowledged commands');
