@@ -11,9 +11,11 @@ import {
   encodeSetClock,
   encodeSetClockParam,
   encodeSetMeterType,
+  encodeSetReportingMode,
   encodeSetServerAddress,
   encodeSetServerEndpoint,
   encodeValveOperation,
+  dailyReportLimitFor,
   METERING_MODE_BYTES,
   PAYMENT_MODE_BYTES,
   IN_PLACE_MODE_BYTES,
@@ -250,6 +252,69 @@ export function commandRouter(queue, log = console, { token = null } = {}) {
       status: 'queued',
       command: queue.get(cmd.id),
       note: "delivered at the meter's next contact; confirm via the table type code in the following report",
+    });
+  });
+
+  // How often the meter reports (AA06, section 2.7).
+  //
+  // Worth doing by hand at least once before trusting the auto-configure rung:
+  // AA06 has never been accepted by this firmware, and this route is how you
+  // find out on a meter you picked rather than on whichever one reports first.
+  //
+  // Shortening is the safe direction. A meter set to a long interval is out of
+  // reach for that long -- there is no way to poll it -- so the mistake takes
+  // as long to fix as the interval you mistyped.
+  router.post('/meters/:address/reporting', (req, res) => {
+    const { address } = req.params;
+    if (!ADDRESS_RE.test(address)) {
+      return res.status(400).json({ ok: false, reason: 'bad_address', detail: 'expected 14 decimal digits' });
+    }
+
+    // Not defaulted and not coerced, like resolutionLitres: the whole point of
+    // the command is the number, so a caller who omitted it meant something
+    // else. The upper bound is the field width; the lower is the firmware's
+    // documented floor for its own emergency schedule, which is the only hint
+    // the document gives about what this hardware will accept.
+    const intervalMinutes = req.body?.intervalMinutes;
+    if (!Number.isInteger(intervalMinutes) || intervalMinutes < 1 || intervalMinutes > 0xffff) {
+      return res.status(400).json({
+        ok: false,
+        reason: 'bad_interval',
+        detail: 'intervalMinutes must be an integer between 1 and 65535',
+      });
+    }
+
+    const dailyLimit = req.body?.dailyLimit ?? dailyReportLimitFor(intervalMinutes);
+    if (!Number.isInteger(dailyLimit) || dailyLimit < 3 || dailyLimit > 100) {
+      return res.status(400).json({
+        ok: false,
+        reason: 'bad_daily_limit',
+        detail: 'dailyLimit must be an integer between 3 and 100 (section 2.7)',
+      });
+    }
+
+    const meterTypeCode = req.body?.meterTypeCode ?? 0x10;
+    const params = { intervalMinutes, dailyLimit, sentTime: null, meterTypeCode };
+
+    const cmd = queue.enqueue(address, {
+      type: 'set_reporting',
+      params,
+      build: (instructionNumber) => {
+        params.sentTime = new Date().toISOString();
+        return encodeSetReportingMode({ meterTypeCode, address }, { intervalMinutes, dailyLimit }, instructionNumber);
+      },
+    });
+
+    log.info?.(
+      `command queued: set_reporting #${cmd.id} for ${address} -> every ${intervalMinutes} min` +
+        ` (daily limit ${dailyLimit})`,
+    );
+
+    return res.status(202).json({
+      ok: true,
+      status: 'queued',
+      command: queue.get(cmd.id),
+      note: "delivered at the meter's next contact; confirm via the reporting mode in the following report",
     });
   });
 

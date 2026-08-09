@@ -82,10 +82,12 @@ server.listen(PORT, HOST, () => {
   console.log(`command API auth: ${API_TOKEN ? 'x-api-token required' : 'OPEN (set API_TOKEN to require a token)'}`);
   console.log(
     configurer
-      ? `auto-configure: ON -- clock to ${configurer.config.timeZone}, resolution to ` +
+      ? `auto-configure: ON -- ` +
+          `${configurer.config.reportingIntervalMinutes > 0 ? `report every ${configurer.config.reportingIntervalMinutes} min, ` : 'interval rung OFF, '}` +
+          `clock to ${configurer.config.timeZone}, resolution to ` +
           `${configurer.config.resolutionLitres} L, one command per contact, ` +
           `${configurer.config.maxAttempts} attempts each` +
-          `${configurer.config.allowClosedValve ? '  (WILL write AA07 to closed valves, which opens them)' : ''}`
+          `${configurer.config.allowClosedValve ? '  (WILL write AA07/AA06 to closed valves; AA07 opens them)' : ''}`
       : 'auto-configure: OFF (CONFIGURE=0)',
   );
   console.log('storage is in-memory only -- nothing is persisted');

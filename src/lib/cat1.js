@@ -534,6 +534,89 @@ export function encodeSetMeterType(
   return sealCommand(cmd);
 }
 
+// --- how often the meter reports (protocol section 2.7, AA06H) ------------
+
+/** Reporting-mode schemes, byte 0 of the six-byte field. Only C0 is used. */
+export const REPORTING_SCHEME_INTERVAL = 0xc0; // minutes, big-endian, bytes 1-2
+export const REPORTING_SCHEME_DAYS = 0xc1;
+export const REPORTING_SCHEME_HOURS = 0xc2;
+export const REPORTING_SCHEME_MINUTES = 0xc3;
+
+/**
+ * Section 2.7's byte table runs the data field from the identifier at 16 to the
+ * spare ending at 43, with CS at 44 -- that is 1CH. Its stated length cell reads
+ * "28", which is the same number in decimal, so for once the two agree. The
+ * length is still overridable for the same reason as AA05 and AA07: where this
+ * document contradicts itself the firmware has followed the byte positions.
+ */
+export const REPORTING_MODE_DATA_LENGTH = 0x1c;
+
+/** The interval the meter ships with: C0 05A0 FFFFFF, 0x05A0 = 1440 minutes. */
+export const DEFAULT_REPORTING_INTERVAL_MINUTES = 1440;
+
+/**
+ * A meter reporting every `intervalMinutes` fills a day this many times. Byte 18
+ * is a hard cap the firmware applies on top of the interval, so the two have to
+ * agree or the cap silently wins and the interval looks like it did not take.
+ * Clamped to the documented 3-100 range.
+ */
+export function dailyReportLimitFor(intervalMinutes) {
+  return Math.min(100, Math.max(3, Math.ceil(1440 / intervalMinutes)));
+}
+
+/**
+ * Six-byte reporting mode: scheme C0, interval in minutes, big-endian.
+ *
+ * The trailing three bytes are FFH rather than zero because that is what every
+ * meter in the fleet actually reports back in bytes 52-57 (`C005A0FFFFFF`). The
+ * document's own default writes them as zero; matching the hardware means a
+ * successful write reads back byte-identical to what we sent.
+ */
+export function reportingModeBytes(intervalMinutes) {
+  if (!Number.isInteger(intervalMinutes) || intervalMinutes < 1 || intervalMinutes > 0xffff) {
+    throw new FrameError('bad_interval', `reporting interval must be 1-65535 minutes, got ${intervalMinutes}`);
+  }
+  const bytes = Buffer.alloc(6, 0xff);
+  bytes[0] = REPORTING_SCHEME_INTERVAL;
+  bytes.writeUInt16BE(intervalMinutes, 1);
+  return bytes;
+}
+
+/**
+ * Set the reporting interval (protocol section 2.7, data identifier AA06H).
+ *
+ *   68 | T | A6-A0 | 03 | 04 | instruction no. | 0000 | 1CH | AA06 |
+ *   daily limit | reporting mode(6) | valve shield(2) | history gate |
+ *   emergency(6) | valve gate | mfr gate | spare(8) | CS | 16   -- 46 bytes
+ *
+ * Like AA07 this command carries several unrelated settings in one frame, and
+ * AA07 is the one that opens valves: it rewrites the fields either side of the
+ * one you wanted and the firmware re-evaluates. Two of the passengers here are
+ * the valve-control shielding (25-26) and its modification gate (34).
+ *
+ * So every passenger is held at zero and none is exposed. Byte 34 is left at
+ * zero rather than 0xAD ("allows modification"), byte 35 at zero rather than
+ * 0xAE, and byte 27 at zero rather than 0xAC/0xCA -- so the frame asks to change
+ * the reporting schedule and explicitly declines permission to change anything
+ * to do with the valve, the history buffer or the manufacturer code.
+ *
+ * That is the theory. It is untested on this firmware, which is why the caller
+ * should prove it on one meter with an open valve before it goes near a fleet.
+ */
+export function encodeSetReportingMode(
+  { meterTypeCode = 0x10, address },
+  { intervalMinutes, dailyLimit = null, dataLength = REPORTING_MODE_DATA_LENGTH },
+  instructionNumber,
+) {
+  const mode = reportingModeBytes(intervalMinutes);
+  const cmd = commandFrame({ meterTypeCode, address }, WRITE_CONTROL, 0xaa06, instructionNumber, dataLength);
+  cmd[18] = dailyLimit ?? dailyReportLimitFor(intervalMinutes);
+  mode.copy(cmd, 19);
+  // 25-43 stay zero: valve shielding, history gate, emergency reporting, the
+  // two modification gates and the spare. See the note above.
+  return sealCommand(cmd);
+}
+
 // --- where the meter reports to (protocol section III, 0xAC0E / 0xAC0F) ----
 
 export const SERVER_ADDRESS_PRIMARY = 0xac0e;

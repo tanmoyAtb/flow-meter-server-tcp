@@ -14,17 +14,59 @@
 //
 // The ladder, highest priority first:
 //
-//   1. clock not on the target zone   -> AA00   (must be alone and first anyway)
-//   2. resolution not the target      -> AA07
-//   3. nothing wrong                  -> no command, just the power-off ack
+//   1. reporting interval not the target -> AA06
+//   2. clock not on the target zone      -> AA00   (must be alone anyway)
+//   3. resolution not the target         -> AA07
+//   4. nothing wrong                     -> no command, just the power-off ack
+//
+// The interval goes first because it is the rung that pays for the others. At
+// the factory 1440 minutes a meter needing all three settings takes three days
+// to converge, one command per contact; at 30 minutes the remaining two rungs
+// finish within the hour. It is also safe to move ahead of the clock, because
+// scheme C0 counts elapsed minutes rather than firing at a wall-clock time --
+// so a meter whose clock is still wrong keeps the interval we gave it.
+//
+// The risk it carries is that AA06 is unproven on this firmware, and a rung
+// that keeps failing consumes every contact up to maxAttempts before the rungs
+// below it get a turn. CONFIGURE_REPORT_INTERVAL_MIN=0 disables this rung
+// without a redeploy, which is the kill switch if the first meter refuses it.
 //
 // See the "Auto-configure" section of the README for the operational picture.
 
-import { encodeSetClock, encodeSetMeterType, clockParts, METERING_MODE_BYTES } from './lib/cat1.js';
+import {
+  encodeSetClock,
+  encodeSetMeterType,
+  encodeSetReportingMode,
+  clockParts,
+  METERING_MODE_BYTES,
+  REPORTING_SCHEME_INTERVAL,
+} from './lib/cat1.js';
 
 export const CONFIGURE_DEFAULTS = {
   timeZone: 'Asia/Dhaka',
-  resolutionLitres: 1,
+  /**
+   * Metering resolution, in litres. 1000 is one cubic metre.
+   *
+   * This is coarser than the 1 L it replaced, not finer: at 1000 the register
+   * does not move until a whole cubic metre has passed, so everything below
+   * that is lost at the meter and cannot be recovered here. That is the asked-for
+   * behaviour -- billing is in m3 -- but it is worth saying plainly, because a
+   * meter on this setting under a light load looks broken for days at a time.
+   *
+   * It lives here rather than only in the environment so a box that comes up
+   * without its unit file overrides still runs the fleet policy instead of
+   * quietly reverting to litres. Same reasoning as the RECONCILE_* fallback
+   * below: the dangerous failure is the one nobody notices.
+   */
+  resolutionLitres: 1000,
+  /**
+   * How often the meter should report, in minutes. 0 disables the rung.
+   *
+   * Every report is a cellular attach on a battery device, so this number is a
+   * battery-life decision as much as a data one: 30 minutes is 48 attaches a
+   * day against the factory 1. Set it deliberately.
+   */
+  reportingIntervalMinutes: 30,
   /**
    * How far off the meter's clock may be before it is worth a command.
    *
@@ -55,6 +97,12 @@ export const CONFIGURE_DEFAULTS = {
    * makes this firmware re-evaluate and open. A resolution change is cosmetic;
    * turning someone's water back on is not, and doing it unattended across a
    * fleet is not something to discover from a billing complaint.
+   *
+   * This gates AA06 as well. There the risk is theoretical rather than observed
+   * -- the frame holds the valve-shielding bytes and their modification gate at
+   * zero -- but it is the same frame shape that surprised us with AA07, and the
+   * only meter it currently costs us is one whose valve was closed on purpose.
+   * Once AA06 is proven on an open-valve meter this can be relaxed.
    */
   allowClosedValve: false,
 };
@@ -76,6 +124,7 @@ export function configureOptionsFromEnv(env = process.env) {
     enabled: (env.CONFIGURE ?? env.RECONCILE) !== '0',
     timeZone: str('TIMEZONE') ?? CONFIGURE_DEFAULTS.timeZone,
     resolutionLitres: num('RESOLUTION_LITRES', CONFIGURE_DEFAULTS.resolutionLitres),
+    reportingIntervalMinutes: num('REPORT_INTERVAL_MIN', CONFIGURE_DEFAULTS.reportingIntervalMinutes),
     clockToleranceSeconds: num('CLOCK_TOLERANCE_S', CONFIGURE_DEFAULTS.clockToleranceSeconds),
     maxAttempts: num('MAX_ATTEMPTS', CONFIGURE_DEFAULTS.maxAttempts),
     allowClosedValve: str('ALLOW_CLOSED_VALVE') === '1',
@@ -157,7 +206,57 @@ export function createConfigurer(options = {}) {
       const target = { meterTypeCode, address };
       const notes = [];
 
-      // --- 1. clock ------------------------------------------------------
+      // --- 1. reporting interval -----------------------------------------
+      // Two ways a meter needs this rung: it is on scheme C0 at the wrong
+      // number of minutes, or it is on one of the calendar schemes (C1 days,
+      // C2 hours, C3 minutes) where there is no interval to compare at all.
+      // Both are answered by writing C0 at the target.
+      if (config.reportingIntervalMinutes > 0) {
+        const mode = payload.reportingMode;
+        const onInterval = mode?.scheme === REPORTING_SCHEME_INTERVAL;
+        const actualMinutes = onInterval ? mode.intervalMinutes : null;
+
+        if (mode && actualMinutes !== config.reportingIntervalMinutes) {
+          const valve = payload.status?.valve;
+          if (valve !== 'open' && !config.allowClosedValve) {
+            notes.push(
+              `reporting interval is ${mode.description ?? mode.raw} but valve is ${valve}; ` +
+                `AA06 held back as a precaution (CONFIGURE_ALLOW_CLOSED_VALVE=1 to override)`,
+            );
+          } else if (claim(address, 'set_reporting')) {
+            return {
+              notes,
+              command: {
+                type: 'set_reporting',
+                reason: onInterval
+                  ? `reports every ${actualMinutes} min, want ${config.reportingIntervalMinutes} min`
+                  : `reporting scheme is ${mode.raw}, want every ${config.reportingIntervalMinutes} min`,
+                params: {
+                  fromMinutes: actualMinutes,
+                  toMinutes: config.reportingIntervalMinutes,
+                  fromRaw: mode.raw,
+                  source: 'configurer',
+                },
+                build: (instructionNumber) =>
+                  encodeSetReportingMode(
+                    target,
+                    { intervalMinutes: config.reportingIntervalMinutes },
+                    instructionNumber,
+                  ),
+              },
+            };
+          } else {
+            notes.push(
+              `reporting interval still ${mode.description ?? mode.raw} after ` +
+                `${config.maxAttempts} attempts -- needs a look`,
+            );
+          }
+        } else if (mode) {
+          clear(address, 'set_reporting');
+        }
+      }
+
+      // --- 2. clock ------------------------------------------------------
       const skew = clockSkewSeconds(payload.meterClock?.iso, now, config.timeZone);
       if (skew === null) {
         notes.push(`clock unreadable (${payload.meterClock?.raw ?? 'no clock field'})`);
@@ -179,7 +278,7 @@ export function createConfigurer(options = {}) {
         clear(address, 'set_clock');
       }
 
-      // --- 2. metering resolution ----------------------------------------
+      // --- 3. metering resolution ----------------------------------------
       const actual = payload.meterConfig?.resolutionLitres;
       if (actual !== undefined && actual !== config.resolutionLitres) {
         const valve = payload.status?.valve;
