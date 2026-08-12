@@ -34,9 +34,16 @@ const read = (frame) => {
  *
  * The reporting interval defaults to the target rather than to the fixture's
  * own 1440, because it is now the top rung: left alone it would pre-empt every
- * test below it and none of them would be testing what its name says.
+ * test below it and none of them would be testing what its name says. It reads
+ * the target off the policy rather than repeating the number, so changing the
+ * fleet interval does not break sixteen unrelated tests.
  */
-function frameWith({ tableTypeCode, clock, statusWord, reportingIntervalMinutes = 30 } = {}) {
+function frameWith({
+  tableTypeCode,
+  clock,
+  statusWord,
+  reportingIntervalMinutes = CONFIGURE_DEFAULTS.reportingIntervalMinutes,
+} = {}) {
   const buf = Buffer.from(CAT1_FRAME);
   if (tableTypeCode !== undefined) buf.writeUInt16BE(tableTypeCode, 19);
   if (statusWord !== undefined) buf.writeUInt16BE(statusWord, 58);
@@ -100,7 +107,7 @@ test('the reporting interval outranks the clock and the resolution', () => {
   const { command } = toLitres().decide(read(CAT1_FRAME));
   assert.equal(command.type, 'set_reporting');
   assert.equal(command.params.fromMinutes, 1440);
-  assert.equal(command.params.toMinutes, 30);
+  assert.equal(command.params.toMinutes, 360);
 });
 
 test('the interval command carries AA06 and the minutes big-endian', () => {
@@ -109,8 +116,8 @@ test('the interval command carries AA06 and the minutes big-endian', () => {
   assert.equal(frame.length, 46);
   assert.equal(frame[15], 0x1c, 'm = 1CH');
   assert.equal(frame.readUInt16BE(16), 0xaa06);
-  assert.equal(frame[18], 48, '1440 / 30, inside the documented 3-100 range');
-  assert.equal(frame.subarray(19, 25).toString('hex'), 'c0001effffff');
+  assert.equal(frame[18], 4, '1440 / 360, clamped up to the documented floor of 3');
+  assert.equal(frame.subarray(19, 25).toString('hex'), 'c00168ffffff', '360 minutes');
   assert.equal(frame.readUInt16BE(11), 7, 'instruction number');
 });
 
@@ -123,7 +130,11 @@ test('AA06 leaves every passenger field alone, including the valve gates', () =>
 });
 
 test('a meter already on the target interval is left alone by this rung', () => {
-  const frame = frameWith({ reportingIntervalMinutes: 30, clock: [26, 8, 5, 12, 0, 0], tableTypeCode: CODE_FOR[1] });
+  const frame = frameWith({
+    reportingIntervalMinutes: CONFIGURE_DEFAULTS.reportingIntervalMinutes,
+    clock: [26, 8, 5, 12, 0, 0],
+    tableTypeCode: CODE_FOR[1],
+  });
   const decision = toLitres().decide(read(frame), new Date(dhakaNowFor('2026-08-05T12:00:00')));
   assert.equal(decision.command, null);
 });
@@ -291,12 +302,12 @@ test('a meter that complies has its attempts forgiven', () => {
 
 // --- configuration --------------------------------------------------------
 
-test('the shipped defaults are the fleet policy: m3, every 30 minutes, Dhaka', () => {
+test('the shipped defaults are the fleet policy: m3, every 6 hours, Dhaka', () => {
   // These three are the whole ask. They are asserted here rather than left to
   // the unit file because a box coming up without its overrides should still
   // run the policy -- the dangerous failure is the one nobody notices.
   assert.equal(CONFIGURE_DEFAULTS.resolutionLitres, 1000, 'one cubic metre');
-  assert.equal(CONFIGURE_DEFAULTS.reportingIntervalMinutes, 30);
+  assert.equal(CONFIGURE_DEFAULTS.reportingIntervalMinutes, 360, 'six hours');
   assert.equal(CONFIGURE_DEFAULTS.timeZone, 'Asia/Dhaka');
   assert.equal(METERING_MODE_BYTES[1000], 0x80, 'the byte AA07 carries for m3');
 });
@@ -306,7 +317,7 @@ test('the environment is read with safe defaults', () => {
     enabled: true,
     timeZone: CONFIGURE_DEFAULTS.timeZone,
     resolutionLitres: 1000,
-    reportingIntervalMinutes: 30,
+    reportingIntervalMinutes: 360,
     clockToleranceSeconds: 120,
     maxAttempts: 3,
     allowClosedValve: false,

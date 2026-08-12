@@ -1,7 +1,11 @@
 import express from 'express';
 import { commandRouter } from './routes/commands.js';
 
-export function createApp(store, log = console, { commands = null, apiToken = null, configurer = null } = {}) {
+export function createApp(
+  store,
+  log = console,
+  { commands = null, apiToken = null, configurer = null, partner = null } = {},
+) {
   const app = express();
   app.disable('x-powered-by');
 
@@ -18,6 +22,14 @@ export function createApp(store, log = console, { commands = null, apiToken = nu
   app.get('/api/v1/configure', (req, res) => {
     if (!configurer) return res.json({ ok: true, enabled: false });
     res.json({ ok: true, enabled: true, config: configurer.config, attempts: configurer.state() });
+  });
+
+  // Whether readings are being copied to the partner, and how that is going.
+  // Counters only -- an ack proves they parsed the header, not that they stored
+  // anything, so a healthy count here is not evidence the data landed.
+  app.get('/api/v1/partner', (req, res) => {
+    if (!partner) return res.json({ ok: true, enabled: false });
+    res.json({ ok: true, ...partner.stats() });
   });
 
   app.get('/debug/store', (req, res) => res.json(store.snapshot()));

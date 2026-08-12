@@ -67,6 +67,7 @@ export function createMeterConnectionHandler(
   {
     commands = null,
     configurer = null,
+    partner = null,
     commandDelayMs = COMMAND_DELAY_MS,
     ackBeforeCommand = ACK_BEFORE_COMMAND,
   } = {},
@@ -186,6 +187,11 @@ export function createMeterConnectionHandler(
 
       const { duplicate } = store.saveCat1Reading(reading, hex);
       log.info?.(formatCat1Reading(reading, hex, { duplicate, source: 'tcp' }));
+
+      // Hand it to the partner last, and never wait for it. The meter has
+      // already had its ack or its command by this point, so a slow or dead
+      // partner cannot cost it a contact. See src/partner.js for the switch.
+      partner?.forward(hex, envelope, { duplicate });
     };
 
     /**

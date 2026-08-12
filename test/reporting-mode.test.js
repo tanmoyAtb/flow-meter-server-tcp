@@ -29,14 +29,15 @@ const at = (intervalMinutes) =>
 
 // --- the six-byte reporting mode field ------------------------------------
 
-test('the factory value decodes to the interval the fleet actually reports', () => {
-  // Every meter in the fleet reports C005A0FFFFFF in bytes 52-57 of packet 03.
+test('the factory value decodes to the interval the meters shipped on', () => {
+  // Every meter arrived reporting C005A0FFFFFF in bytes 52-57 of packet 03.
   assert.equal(reportingModeBytes(DEFAULT_REPORTING_INTERVAL_MINUTES).toString('hex'), 'c005a0ffffff');
 });
 
 test('minutes are big-endian, and the trailing bytes match the hardware', () => {
   assert.equal(reportingModeBytes(30).toString('hex'), 'c0001effffff');
   assert.equal(reportingModeBytes(60).toString('hex'), 'c0003cffffff');
+  assert.equal(reportingModeBytes(360).toString('hex'), 'c00168ffffff', 'the fleet policy: 6 hours');
   assert.equal(reportingModeBytes(720).toString('hex'), 'c002d0ffffff');
 });
 
@@ -53,6 +54,7 @@ test('the daily cap is derived to match the interval', () => {
   // interval implies silently wins and the interval looks like it never took.
   assert.equal(dailyReportLimitFor(30), 48);
   assert.equal(dailyReportLimitFor(60), 24);
+  assert.equal(dailyReportLimitFor(360), 4, 'the fleet policy: four contacts a day');
   assert.equal(dailyReportLimitFor(1440), 3, 'clamped up to the documented floor');
   assert.equal(dailyReportLimitFor(1), 100, 'clamped down to the documented ceiling');
 });

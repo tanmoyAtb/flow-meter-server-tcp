@@ -21,15 +21,22 @@
 //
 // The interval goes first because it is the rung that pays for the others. At
 // the factory 1440 minutes a meter needing all three settings takes three days
-// to converge, one command per contact; at 30 minutes the remaining two rungs
-// finish within the hour. It is also safe to move ahead of the clock, because
-// scheme C0 counts elapsed minutes rather than firing at a wall-clock time --
-// so a meter whose clock is still wrong keeps the interval we gave it.
+// to converge, one command per contact; at the 360 we now ask for, the same
+// meter finishes in 18 hours. It is also safe to move ahead of the clock,
+// because scheme C0 counts elapsed minutes rather than firing at a wall-clock
+// time -- so a meter whose clock is still wrong keeps the interval we gave it.
 //
-// The risk it carries is that AA06 is unproven on this firmware, and a rung
-// that keeps failing consumes every contact up to maxAttempts before the rungs
-// below it get a turn. CONFIGURE_REPORT_INTERVAL_MIN=0 disables this rung
-// without a redeploy, which is the kill switch if the first meter refuses it.
+// Going first cuts both ways once the interval is widening rather than
+// narrowing. A meter that is on 30 minutes and also has a wrong resolution
+// spends its next contact on AA06, and only then starts waiting six hours
+// between chances to fix anything else. That is the right order anyway -- the
+// alternative is holding the fleet at 48 attaches a day while the tail
+// converges -- but it does mean the last rung of a rollout is the slow one.
+//
+// The risk it carries is a rung that keeps failing, which consumes every
+// contact up to maxAttempts before the rungs below it get a turn -- expensive
+// at 6-hourly contacts. CONFIGURE_REPORT_INTERVAL_MIN=0 disables this rung
+// without a redeploy, which is the kill switch.
 //
 // See the "Auto-configure" section of the README for the operational picture.
 
@@ -63,10 +70,22 @@ export const CONFIGURE_DEFAULTS = {
    * How often the meter should report, in minutes. 0 disables the rung.
    *
    * Every report is a cellular attach on a battery device, so this number is a
-   * battery-life decision as much as a data one: 30 minutes is 48 attaches a
-   * day against the factory 1. Set it deliberately.
+   * battery-life decision as much as a data one: 360 is 4 attaches a day,
+   * against the 48 that 30 minutes cost us and the factory's 1. Set it
+   * deliberately.
+   *
+   * The other thing it buys is granularity, and at m3 resolution that matters
+   * less than it looks: a meter only moves its register once a cubic metre has
+   * passed, so on light usage six-hourly reports and half-hourly ones carry the
+   * same information -- the same unchanged number, four times a day instead of
+   * forty-eight.
+   *
+   * What it costs is the feedback loop. Every rung below takes one contact, so
+   * a meter needing all three now converges in 18 hours rather than 90 minutes,
+   * and any future policy change lands at the same pace. Nothing here is
+   * time-critical, but do not expect to watch a rollout finish.
    */
-  reportingIntervalMinutes: 30,
+  reportingIntervalMinutes: 360,
   /**
    * How far off the meter's clock may be before it is worth a command.
    *

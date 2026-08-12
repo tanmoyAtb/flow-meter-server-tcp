@@ -5,6 +5,7 @@ import { openStore } from './store/memory.js';
 import { createCommandQueue } from './commands.js';
 import { createMeterConnectionHandler } from './tcp.js';
 import { createConfigurer, configureOptionsFromEnv } from './configure.js';
+import { createPartnerForwarder } from './partner.js';
 import { timestampedLog } from './lib/log.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -29,9 +30,14 @@ const log = timestampedLog(console);
 // Mock store: everything lives in memory and is lost on restart.
 const store = openStore();
 const commands = createCommandQueue();
-const app = createApp(store, log, { commands, apiToken: API_TOKEN, configurer });
+// Copies every reading on to the partner's ingest server, fire and forget.
+// The switch is PARTNER_FORWARDING in src/partner.js -- deliberately code, not
+// environment, so what we send to a third party is visible in the diff.
+const partner = createPartnerForwarder(log);
+
+const app = createApp(store, log, { commands, apiToken: API_TOKEN, configurer, partner });
 const httpServer = http.createServer(app);
-const handleMeterConnection = createMeterConnectionHandler(store, log, { commands, configurer });
+const handleMeterConnection = createMeterConnectionHandler(store, log, { commands, configurer, partner });
 
 // Meters cannot be pointed at a second port -- they are provisioned with one
 // address and push raw frames down it. Rather than split raw TCP and HTTP across
@@ -89,6 +95,11 @@ server.listen(PORT, HOST, () => {
           `${configurer.config.maxAttempts} attempts each` +
           `${configurer.config.allowClosedValve ? '  (WILL write AA07/AA06 to closed valves; AA07 opens them)' : ''}`
       : 'auto-configure: OFF (CONFIGURE=0)',
+  );
+  console.log(
+    partner.enabled
+      ? `partner forwarding: ON -- every reading copied to ${partner.stats().endpoint} (fire and forget)`
+      : 'partner forwarding: OFF (PARTNER_FORWARDING in src/partner.js)',
   );
   console.log('storage is in-memory only -- nothing is persisted');
 });
