@@ -19,24 +19,25 @@
 //   3. resolution not the target         -> AA07
 //   4. nothing wrong                     -> no command, just the power-off ack
 //
-// The interval goes first because it is the rung that pays for the others. At
-// the factory 1440 minutes a meter needing all three settings takes three days
-// to converge, one command per contact; at the 360 we now ask for, the same
-// meter finishes in 18 hours. It is also safe to move ahead of the clock,
-// because scheme C0 counts elapsed minutes rather than firing at a wall-clock
-// time -- so a meter whose clock is still wrong keeps the interval we gave it.
+// The interval goes first because it is the rung that sets the pace of all the
+// others. It is also safe to move ahead of the clock, because scheme C0 counts
+// elapsed minutes rather than firing at a wall-clock time -- so a meter whose
+// clock is still wrong keeps the interval we gave it.
 //
-// Going first cuts both ways once the interval is widening rather than
-// narrowing. A meter that is on 30 minutes and also has a wrong resolution
-// spends its next contact on AA06, and only then starts waiting six hours
-// between chances to fix anything else. That is the right order anyway -- the
-// alternative is holding the fleet at 48 attaches a day while the tail
-// converges -- but it does mean the last rung of a rollout is the slow one.
+// That ordering was free while the interval was narrowing. At the factory's
+// 1440 a meter needing all three settings took three days to converge, one
+// command per contact, and moving it to 30 first cut the remaining two to 90
+// minutes. It is not free now. At the 720 we ask for, the same meter takes 36
+// hours, and the first command we send is the one that slows the other two
+// down. It is still the right order -- the alternative is holding the fleet at
+// a higher attach rate while the tail converges, and the attach rate is the
+// entire point of the number -- but the last rung of a rollout is now the slow
+// one, by design.
 //
 // The risk it carries is a rung that keeps failing, which consumes every
-// contact up to maxAttempts before the rungs below it get a turn -- expensive
-// at 6-hourly contacts. CONFIGURE_REPORT_INTERVAL_MIN=0 disables this rung
-// without a redeploy, which is the kill switch.
+// contact up to maxAttempts before the rungs below it get a turn -- a day and
+// a half at 12-hourly contacts. CONFIGURE_REPORT_INTERVAL_MIN=0 disables this
+// rung without a redeploy, which is the kill switch.
 //
 // See the "Auto-configure" section of the README for the operational picture.
 
@@ -70,22 +71,35 @@ export const CONFIGURE_DEFAULTS = {
    * How often the meter should report, in minutes. 0 disables the rung.
    *
    * Every report is a cellular attach on a battery device, so this number is a
-   * battery-life decision as much as a data one: 360 is 4 attaches a day,
-   * against the 48 that 30 minutes cost us and the factory's 1. Set it
-   * deliberately.
+   * battery-life decision as much as a data one: 720 is 2 attaches a day,
+   * against the 4 that 6 hours cost us, the 48 of the half-hourly setting this
+   * fleet ran on before that, and the factory's 1. Set it deliberately.
    *
-   * The other thing it buys is granularity, and at m3 resolution that matters
-   * less than it looks: a meter only moves its register once a cubic metre has
-   * passed, so on light usage six-hourly reports and half-hourly ones carry the
-   * same information -- the same unchanged number, four times a day instead of
-   * forty-eight.
+   * Granularity is the obvious thing it trades away, and at m3 resolution that
+   * matters less than it looks: a meter only moves its register once a cubic
+   * metre has passed, so on light usage a twice-daily report and a half-hourly
+   * one carry the same information -- the same unchanged number, twice a day
+   * instead of forty-eight times.
    *
-   * What it costs is the feedback loop. Every rung below takes one contact, so
-   * a meter needing all three now converges in 18 hours rather than 90 minutes,
-   * and any future policy change lands at the same pace. Nothing here is
-   * time-critical, but do not expect to watch a rollout finish.
+   * What it actually costs is the feedback loop, and that cost compounds. Every
+   * rung below takes one contact, so a meter needing all three converges in 36
+   * hours rather than the 18 it took at 6 hours or the 90 minutes it took at
+   * 30, and any future policy change lands at the same pace. Nothing here is
+   * time-critical, but a rollout is now something you check the next day rather
+   * than something you watch.
+   *
+   * It costs detection too. Nothing is heard from a meter for up to 12 hours,
+   * so a dead one, a leak or a valve event surfaces that much later -- and
+   * there is no staleness alarm anywhere in this codebase to notice a meter
+   * that has simply stopped talking.
+   *
+   * Mind the daily cap that rides along. dailyReportLimitFor clamps up to the
+   * documented floor of 3, so 720 goes out with a cap of 3 against 2 timed
+   * reports: the first interval where the two stop matching exactly. That is
+   * headroom rather than a bug -- at 360 the cap was exactly 4 against 4 timed
+   * reports, which left an event-triggered report nowhere to go.
    */
-  reportingIntervalMinutes: 360,
+  reportingIntervalMinutes: 720,
   /**
    * How far off the meter's clock may be before it is worth a command.
    *

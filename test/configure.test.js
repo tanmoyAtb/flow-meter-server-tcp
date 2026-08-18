@@ -107,7 +107,7 @@ test('the reporting interval outranks the clock and the resolution', () => {
   const { command } = toLitres().decide(read(CAT1_FRAME));
   assert.equal(command.type, 'set_reporting');
   assert.equal(command.params.fromMinutes, 1440);
-  assert.equal(command.params.toMinutes, 360);
+  assert.equal(command.params.toMinutes, 720);
 });
 
 test('the interval command carries AA06 and the minutes big-endian', () => {
@@ -116,8 +116,8 @@ test('the interval command carries AA06 and the minutes big-endian', () => {
   assert.equal(frame.length, 46);
   assert.equal(frame[15], 0x1c, 'm = 1CH');
   assert.equal(frame.readUInt16BE(16), 0xaa06);
-  assert.equal(frame[18], 4, '1440 / 360, clamped up to the documented floor of 3');
-  assert.equal(frame.subarray(19, 25).toString('hex'), 'c00168ffffff', '360 minutes');
+  assert.equal(frame[18], 3, '1440 / 720 is 2, clamped up to the documented floor of 3');
+  assert.equal(frame.subarray(19, 25).toString('hex'), 'c002d0ffffff', '720 minutes');
   assert.equal(frame.readUInt16BE(11), 7, 'instruction number');
 });
 
@@ -302,12 +302,12 @@ test('a meter that complies has its attempts forgiven', () => {
 
 // --- configuration --------------------------------------------------------
 
-test('the shipped defaults are the fleet policy: m3, every 6 hours, Dhaka', () => {
+test('the shipped defaults are the fleet policy: m3, every 12 hours, Dhaka', () => {
   // These three are the whole ask. They are asserted here rather than left to
   // the unit file because a box coming up without its overrides should still
   // run the policy -- the dangerous failure is the one nobody notices.
   assert.equal(CONFIGURE_DEFAULTS.resolutionLitres, 1000, 'one cubic metre');
-  assert.equal(CONFIGURE_DEFAULTS.reportingIntervalMinutes, 360, 'six hours');
+  assert.equal(CONFIGURE_DEFAULTS.reportingIntervalMinutes, 720, 'twelve hours');
   assert.equal(CONFIGURE_DEFAULTS.timeZone, 'Asia/Dhaka');
   assert.equal(METERING_MODE_BYTES[1000], 0x80, 'the byte AA07 carries for m3');
 });
@@ -317,7 +317,7 @@ test('the environment is read with safe defaults', () => {
     enabled: true,
     timeZone: CONFIGURE_DEFAULTS.timeZone,
     resolutionLitres: 1000,
-    reportingIntervalMinutes: 360,
+    reportingIntervalMinutes: 720,
     clockToleranceSeconds: 120,
     maxAttempts: 3,
     allowClosedValve: false,

@@ -37,8 +37,8 @@ test('the factory value decodes to the interval the meters shipped on', () => {
 test('minutes are big-endian, and the trailing bytes match the hardware', () => {
   assert.equal(reportingModeBytes(30).toString('hex'), 'c0001effffff');
   assert.equal(reportingModeBytes(60).toString('hex'), 'c0003cffffff');
-  assert.equal(reportingModeBytes(360).toString('hex'), 'c00168ffffff', 'the fleet policy: 6 hours');
-  assert.equal(reportingModeBytes(720).toString('hex'), 'c002d0ffffff');
+  assert.equal(reportingModeBytes(360).toString('hex'), 'c00168ffffff');
+  assert.equal(reportingModeBytes(720).toString('hex'), 'c002d0ffffff', 'the fleet policy: 12 hours');
 });
 
 test('an interval that will not fit the field is refused rather than truncated', () => {
@@ -54,7 +54,12 @@ test('the daily cap is derived to match the interval', () => {
   // interval implies silently wins and the interval looks like it never took.
   assert.equal(dailyReportLimitFor(30), 48);
   assert.equal(dailyReportLimitFor(60), 24);
-  assert.equal(dailyReportLimitFor(360), 4, 'the fleet policy: four contacts a day');
+  assert.equal(dailyReportLimitFor(360), 4);
+  assert.equal(
+    dailyReportLimitFor(720),
+    3,
+    'the fleet policy: 2 timed reports a day, but the floor clamps the cap to 3',
+  );
   assert.equal(dailyReportLimitFor(1440), 3, 'clamped up to the documented floor');
   assert.equal(dailyReportLimitFor(1), 100, 'clamped down to the documented ceiling');
 });

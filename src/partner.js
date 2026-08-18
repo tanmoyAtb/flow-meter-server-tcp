@@ -39,10 +39,11 @@ const DEFAULTS = {
   /**
    * Concurrent connections to the partner.
    *
-   * The fleet reports every 6 hours, and meters cluster: fourteen contacts can
+   * The fleet reports every 12 hours, and meters cluster: fourteen contacts can
    * land inside a couple of minutes. Four at a time keeps that civil rather
-   * than opening a socket per meter simultaneously. Widening the interval made
-   * the bursts rarer, not smaller -- it is the burst this number is sized for.
+   * than opening a socket per meter simultaneously. Widening the interval has
+   * only ever made the bursts rarer, never smaller -- it is the burst this
+   * number is sized for, so it does not move when the interval does.
    */
   maxInFlight: 4,
   /**
