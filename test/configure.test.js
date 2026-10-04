@@ -70,6 +70,18 @@ function frameWith({
  */
 const LADDER_FRAME = frameWith({});
 
+/**
+ * An interval that is deliberately NOT the policy, so the top rung is in play
+ * whatever the policy happens to be.
+ *
+ * The tests below used CAT1_FRAME for this, which worked only while the policy
+ * differed from the fixture's factory 1440 -- and the policy is now 1440
+ * itself, so the fixture stopped exercising the rung at all. Deriving the wrong
+ * value from the right one keeps that from happening again.
+ */
+const OFF_POLICY_MINUTES = CONFIGURE_DEFAULTS.reportingIntervalMinutes === 30 ? 60 : 30;
+const OFF_POLICY_FRAME = frameWith({ reportingIntervalMinutes: OFF_POLICY_MINUTES });
+
 /** Table type code with the resolution bits set, keeping the rest of 0027. */
 const CODE_FOR = { 1: 0x0024, 10: 0x0025, 100: 0x0026, 1000: 0x0027 };
 
@@ -102,22 +114,26 @@ test('unreadable BCD is not mistaken for a clock at the epoch', () => {
 // --- the reporting interval, the top rung ---------------------------------
 
 test('the reporting interval outranks the clock and the resolution', () => {
-  // The fixture is wrong in all three ways: 1440 min, a 2023 clock and 1000 L.
-  // The interval goes first because it is what makes the other two quick.
-  const { command } = toLitres().decide(read(CAT1_FRAME));
+  // The fixture is wrong in all three ways: an off-policy interval, a 2023
+  // clock and 1000 L. The interval goes first because it paces the other two.
+  const { command } = toLitres().decide(read(OFF_POLICY_FRAME));
   assert.equal(command.type, 'set_reporting');
-  assert.equal(command.params.fromMinutes, 1440);
-  assert.equal(command.params.toMinutes, 720);
+  assert.equal(command.params.fromMinutes, OFF_POLICY_MINUTES);
+  assert.equal(command.params.toMinutes, 1440);
 });
 
 test('the interval command carries AA06 and the minutes big-endian', () => {
-  const { command } = toLitres().decide(read(CAT1_FRAME));
+  const { command } = toLitres().decide(read(OFF_POLICY_FRAME));
   const frame = command.build(7);
   assert.equal(frame.length, 46);
   assert.equal(frame[15], 0x1c, 'm = 1CH');
   assert.equal(frame.readUInt16BE(16), 0xaa06);
-  assert.equal(frame[18], 3, '1440 / 720 is 2, clamped up to the documented floor of 3');
-  assert.equal(frame.subarray(19, 25).toString('hex'), 'c002d0ffffff', '720 minutes');
+  assert.equal(frame[18], 3, '1440 / 1440 is 1, clamped up to the documented floor of 3');
+  assert.equal(
+    frame.subarray(19, 25).toString('hex'),
+    'c005a0ffffff',
+    '1440 minutes -- which is also the value every meter shipped with',
+  );
   assert.equal(frame.readUInt16BE(11), 7, 'instruction number');
 });
 
@@ -125,7 +141,7 @@ test('AA06 leaves every passenger field alone, including the valve gates', () =>
   // The lesson of AA07: this firmware re-evaluates whatever the frame touches.
   // Bytes 25-43 carry valve shielding, the history gate, emergency reporting
   // and the two modification gates -- none of which we are asking to change.
-  const frame = toLitres().decide(read(CAT1_FRAME)).command.build(1);
+  const frame = toLitres().decide(read(OFF_POLICY_FRAME)).command.build(1);
   assert.deepEqual(frame.subarray(25, 44), Buffer.alloc(19), 'no modification permission is granted');
 });
 
@@ -140,8 +156,12 @@ test('a meter already on the target interval is left alone by this rung', () => 
 });
 
 test('the interval target is configurable, and 0 disables the rung', () => {
-  const reading = read(CAT1_FRAME); // 1440 min
-  assert.equal(toLitres({ reportingIntervalMinutes: 1440 }).decide(reading).command.type, 'set_clock');
+  const reading = read(CAT1_FRAME); // 1440 min, which is now also the policy
+  assert.equal(
+    toLitres({ reportingIntervalMinutes: 1440 }).decide(reading).command.type,
+    'set_clock',
+    'target met, so the ladder falls through to the clock',
+  );
   assert.equal(
     toLitres({ reportingIntervalMinutes: 0 }).decide(reading).command.type,
     'set_clock',
@@ -168,7 +188,7 @@ test('AA06 is withheld from a meter whose valve is shut', () => {
   // but it is the same shape as the one that surprised us.
   // Clock and resolution already right, so this rung is the only one in play.
   const frame = frameWith({
-    reportingIntervalMinutes: 1440,
+    reportingIntervalMinutes: OFF_POLICY_MINUTES,
     statusWord: 0x0001, // valve closed
     clock: [26, 8, 5, 12, 0, 0],
     tableTypeCode: CODE_FOR[1],
@@ -185,7 +205,7 @@ test('AA06 is withheld from a meter whose valve is shut', () => {
 
 test('giving up on the interval still lets the clock be fixed', () => {
   const configurer = toLitres({ maxAttempts: 1 });
-  const reading = read(CAT1_FRAME);
+  const reading = read(OFF_POLICY_FRAME);
   assert.equal(configurer.decide(reading).command.type, 'set_reporting');
 
   const next = configurer.decide(reading);
@@ -302,12 +322,12 @@ test('a meter that complies has its attempts forgiven', () => {
 
 // --- configuration --------------------------------------------------------
 
-test('the shipped defaults are the fleet policy: m3, every 12 hours, Dhaka', () => {
+test('the shipped defaults are the fleet policy: m3, once a day, Dhaka', () => {
   // These three are the whole ask. They are asserted here rather than left to
   // the unit file because a box coming up without its overrides should still
   // run the policy -- the dangerous failure is the one nobody notices.
   assert.equal(CONFIGURE_DEFAULTS.resolutionLitres, 1000, 'one cubic metre');
-  assert.equal(CONFIGURE_DEFAULTS.reportingIntervalMinutes, 720, 'twelve hours');
+  assert.equal(CONFIGURE_DEFAULTS.reportingIntervalMinutes, 1440, 'twenty-four hours');
   assert.equal(CONFIGURE_DEFAULTS.timeZone, 'Asia/Dhaka');
   assert.equal(METERING_MODE_BYTES[1000], 0x80, 'the byte AA07 carries for m3');
 });
@@ -317,7 +337,7 @@ test('the environment is read with safe defaults', () => {
     enabled: true,
     timeZone: CONFIGURE_DEFAULTS.timeZone,
     resolutionLitres: 1000,
-    reportingIntervalMinutes: 720,
+    reportingIntervalMinutes: 1440,
     clockToleranceSeconds: 120,
     maxAttempts: 3,
     allowClosedValve: false,

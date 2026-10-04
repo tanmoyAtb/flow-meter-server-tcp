@@ -39,7 +39,7 @@ const DEFAULTS = {
   /**
    * Concurrent connections to the partner.
    *
-   * The fleet reports every 12 hours, and meters cluster: fourteen contacts can
+   * The fleet reports once a day, and meters cluster: fourteen contacts can
    * land inside a couple of minutes. Four at a time keeps that civil rather
    * than opening a socket per meter simultaneously. Widening the interval has
    * only ever made the bursts rarer, never smaller -- it is the burst this

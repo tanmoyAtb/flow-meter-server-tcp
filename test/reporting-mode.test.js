@@ -30,7 +30,9 @@ const at = (intervalMinutes) =>
 // --- the six-byte reporting mode field ------------------------------------
 
 test('the factory value decodes to the interval the meters shipped on', () => {
-  // Every meter arrived reporting C005A0FFFFFF in bytes 52-57 of packet 03.
+  // Every meter arrived reporting C005A0FFFFFF in bytes 52-57 of packet 03 --
+  // and after three widenings the fleet policy is back on that same value, so
+  // a factory-fresh meter now needs no AA06 at all.
   assert.equal(reportingModeBytes(DEFAULT_REPORTING_INTERVAL_MINUTES).toString('hex'), 'c005a0ffffff');
 });
 
@@ -38,7 +40,12 @@ test('minutes are big-endian, and the trailing bytes match the hardware', () => 
   assert.equal(reportingModeBytes(30).toString('hex'), 'c0001effffff');
   assert.equal(reportingModeBytes(60).toString('hex'), 'c0003cffffff');
   assert.equal(reportingModeBytes(360).toString('hex'), 'c00168ffffff');
-  assert.equal(reportingModeBytes(720).toString('hex'), 'c002d0ffffff', 'the fleet policy: 12 hours');
+  assert.equal(reportingModeBytes(720).toString('hex'), 'c002d0ffffff');
+  assert.equal(
+    reportingModeBytes(1440).toString('hex'),
+    'c005a0ffffff',
+    'the fleet policy: once a day, the factory value',
+  );
 });
 
 test('an interval that will not fit the field is refused rather than truncated', () => {
@@ -55,12 +62,12 @@ test('the daily cap is derived to match the interval', () => {
   assert.equal(dailyReportLimitFor(30), 48);
   assert.equal(dailyReportLimitFor(60), 24);
   assert.equal(dailyReportLimitFor(360), 4);
+  assert.equal(dailyReportLimitFor(720), 3, '2 timed reports, but the floor clamps the cap to 3');
   assert.equal(
-    dailyReportLimitFor(720),
+    dailyReportLimitFor(1440),
     3,
-    'the fleet policy: 2 timed reports a day, but the floor clamps the cap to 3',
+    'the fleet policy: 1 timed report, clamped up to the floor -- 2 slots spare for events',
   );
-  assert.equal(dailyReportLimitFor(1440), 3, 'clamped up to the documented floor');
   assert.equal(dailyReportLimitFor(1), 100, 'clamped down to the documented ceiling');
 });
 
