@@ -1,4 +1,11 @@
-// Raw TCP collector for meters that push CAT-1 frames straight down a socket.
+// Raw TCP collector for meters that push frames straight down a socket.
+//
+// Two fleets arrive here and they do not speak the same protocol. The original
+// meters speak CAT-1; the Shenzhen Jiaronghua 515A ultrasonic meters speak
+// CJ/T 188. Both use the 68H..16H envelope, so the split is made once, here, by
+// asking isCat1Frame first and isCjt188Frame second -- and from that point the
+// two paths never touch. Nothing about the CAT-1 path changed when the second
+// protocol arrived, which is the property worth keeping.
 //
 // These devices speak no application protocol at all: they open a connection and
 // write the frame. There is no HTTP request to parse, which is why an Express
@@ -20,9 +27,11 @@ import {
   READ_RESPONSE_CONTROL,
   WRITE_RESPONSE_CONTROL,
 } from './lib/cat1.js';
+import { decodeCjt188Frame, decodeCjt188Report, isCjt188Frame, trailingPreamble } from './lib/cjt188.js';
 import { FrameSplitter, peekEnvelope } from './lib/framing.js';
 import {
   formatCat1Reading,
+  formatCjt188Reading,
   formatReadResponse,
   formatTcpEvent,
   formatUnrecognisedFrame,
@@ -102,8 +111,16 @@ export function createMeterConnectionHandler(
 
     const handle = (event) => {
       if (event.type === 'unframed') {
-        log.warn?.(formatUnframedBytes(event.bytes, { peer }));
-        store.recordFailure('tcp', 'unframed_bytes', event.bytes.toString('hex').toUpperCase());
+        // The 515A prefixes its report with FE FE FE -- the preamble carried by
+        // every example in the vendor's protocol document. It is not a frame and
+        // never will be, so it is named rather than reported as a fault. The
+        // bytes are still recorded: whatever precedes the preamble is
+        // undocumented and worth keeping until it is understood.
+        const pre = trailingPreamble(event.bytes);
+        const reason = pre ? `unframed_bytes: CJ/T 188 preamble (${pre} x FEH) preceded by ${event.bytes.length - pre} byte(s)` : 'unframed_bytes';
+        if (pre) log.info?.(formatTcpEvent('preamble', { peer, detail: reason }));
+        else log.warn?.(formatUnframedBytes(event.bytes, { peer }));
+        store.recordFailure('tcp', reason, event.bytes.toString('hex').toUpperCase());
         return;
       }
 
@@ -116,6 +133,20 @@ export function createMeterConnectionHandler(
       // well-formed and still not ours -- reporting it as a CAT-1 decode failure
       // would be a lie, and the raw bytes are what identifies the device anyway.
       if (!isCat1Frame(frame)) {
+        // Not CAT-1. Before writing it off, ask the other protocol we speak.
+        // CAT-1 is asked first and keeps priority: its frames fail the CJ/T 188
+        // length rule anyway (a CAT-1 report puts its control code where that
+        // protocol puts its length), so the two cannot be confused.
+        if (isCjt188Frame(frame)) {
+          try {
+            return decodeCjt188(frame, hex);
+          } catch (err) {
+            if (!(err instanceof FrameError)) throw err;
+            log.warn?.(formatUnrecognisedFrame(frame, peekEnvelope(frame), `${err.code}: ${err.message}`, { peer }));
+            store.recordFailure('tcp', `${err.code}: ${err.message}`, hex);
+            return;
+          }
+        }
         log.warn?.(
           formatUnrecognisedFrame(frame, peekEnvelope(frame), 'not_cat1: envelope is valid but this is not a CAT-1 frame', {
             peer,
@@ -132,6 +163,24 @@ export function createMeterConnectionHandler(
         log.warn?.(formatUnrecognisedFrame(frame, peekEnvelope(frame), `${err.code}: ${err.message}`, { peer }));
         store.recordFailure('tcp', `${err.code}: ${err.message}`, hex);
       }
+    };
+
+    /**
+     * CJ/T 188 metering report.
+     *
+     * Read and recorded only -- nothing is written back yet. The vendor has not
+     * supplied the message definition for data identifier 921F, and with it the
+     * acknowledgement this meter is waiting for, so there is no frame we could
+     * send that we could honestly claim is correct. The AA07 lesson from the
+     * CAT-1 fleet is the reason that matters: a write to a meter we have not
+     * fully understood opened valves. The cost of staying silent is that the
+     * meter retries; the cost of guessing could be worse.
+     */
+    const decodeCjt188 = (frame, hex) => {
+      const envelope = decodeCjt188Frame(frame);
+      const reading = { ...envelope, report: decodeCjt188Report(envelope) };
+      const { duplicate } = store.saveCjt188Reading(reading, hex);
+      log.info?.(formatCjt188Reading(reading, hex, { duplicate, source: 'tcp' }));
     };
 
     const decodeCat1 = (frame, hex) => {

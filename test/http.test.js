@@ -73,7 +73,7 @@ test('debug reset empties the mock store', async () => {
   assert.equal(res.status, 200);
 
   const snapshot = await (await fetch(`${base}/debug/store`)).json();
-  assert.deepEqual(snapshot.counts, { cat1Readings: 0, ingestFailures: 0 });
+  assert.deepEqual(snapshot.counts, { cat1Readings: 0, cjt188Readings: 0, ingestFailures: 0 });
 
   // A reading that was previously a duplicate is accepted again after a reset.
   const again = store.saveCat1Reading(parseCat1(CAT1_FRAMES[0]), CAT1_FRAMES_HEX[0].toUpperCase());

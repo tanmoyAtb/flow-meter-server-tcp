@@ -68,6 +68,7 @@ test('reset clears rows and dedup keys together', () => {
 
   assert.deepEqual(store.snapshot().counts, {
     cat1Readings: 0,
+    cjt188Readings: 0,
     ingestFailures: 0,
   });
   // The dedup key must be gone too, or the row can never be re-added.

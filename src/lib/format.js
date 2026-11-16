@@ -75,6 +75,44 @@ const METER_TYPE_LABELS = { 0x10: 'water', 0x20: 'heat' };
 const hexOf = (bytes) => bytes.toString('hex').toUpperCase();
 
 /** Connection lifecycle, one line each, so a silent device is still visible. */
+/**
+ * CJ/T 188 metering report, from the 515A ultrasonic meter.
+ *
+ * Laid out like formatCat1Reading on purpose -- same rule, same two-space
+ * labels, same raw-first order -- so one pair of eyes can read a log holding
+ * both fleets without re-learning where to look. The fields differ because the
+ * protocols do; the shape does not.
+ *
+ * The `undoc` line is the deliberate part. The vendor has not supplied the
+ * message definition for data identifier 921F, so the bytes this decoder does
+ * not claim are printed rather than dropped, and they stay visible in the log
+ * until the specification arrives and they can be named.
+ */
+export function formatCjt188Reading(reading, hex, { duplicate, source = 'tcp' }) {
+  const r = reading.report;
+  const vol = (reg) => (reg.cubicMetres === null ? `${DASH} (${reg.raw})` : `${reg.sign}${reg.cubicMetres.toFixed(3)} m3`);
+  const days = r.daily.length
+    ? r.daily.map((d) => `${d.date} ${d.forward.sign}${d.forward.cubicMetres?.toFixed(3) ?? DASH}`).join('   ')
+    : DASH;
+  const undoc = Object.entries(r.unknown)
+    .filter(([, v]) => v)
+    .map(([k, v]) => `${k}=${v}`)
+    .join('  ');
+
+  return [
+    rule(`${source}  ${reading.address}${duplicate ? '  (duplicate)' : ''}`),
+    `  raw     ${hex}`,
+    `  frame   CJ/T 188 · ${reading.meterType} meter · ${hex.length / 2} bytes · ${reading.controlName} · DI ${di(reading.identifier)} seq ${reading.sequence}`,
+    `  time    ${r.meterClock.iso ?? r.meterClock.raw}   (meter clock)`,
+    `  usage   forward ${vol(r.forward)}   reverse ${vol(r.reverse)}`,
+    `  daily   ${r.daily.length} record(s)   ${days}`,
+    `  undoc   ${undoc || 'none'}`,
+    '  note    DI 921F has no vendor specification yet; undecoded bytes are kept above',
+  ].join('\n');
+}
+
+const di = (v) => (v === null || v === undefined ? DASH : `0x${v.toString(16).toUpperCase().padStart(4, '0')}`);
+
 export function formatTcpEvent(kind, { peer, detail }) {
   return `··· tcp ${kind}  ${peer}${detail ? `  ${detail}` : ''}`;
 }
